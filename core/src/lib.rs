@@ -11,6 +11,7 @@ pub mod coverage;
 pub mod detect;
 pub mod geo;
 pub mod plume;
+pub mod review;
 pub mod score;
 
 // public surface mirroring lib/index.js.
@@ -24,6 +25,7 @@ pub use geo::{
     bbox_area_km2, epsg_from_mgrs, meters_to_degrees_lat, meters_to_degrees_lon, pad_bbox,
     utm_params, utm_to_wgs84, wgs84_to_utm,
 };
+pub use review::{triage, PlumeCandidate, Verdict};
 pub use score::{
     glint_angle_nadir, glint_penalty, glint_score_from_angle, glint_score_from_elevation,
     glint_suspect, persistence_score, ratio_score, score_cluster, Score,
