@@ -72,6 +72,12 @@ fn aws_l1c_href(it: &Value, key: &str) -> Option<String> {
     })
 }
 
+// cdse's stac records for pre-2026 l1c items omit the B10 asset even though the
+// jp2 is present in the safe on eodata; derive its href from B11's.
+fn cdse_b10(it: &Value) -> Option<String> {
+    href(it, "B10").or_else(|| href(it, "B11").map(|u| u.replace("_B11.jp2", "_B10.jp2")))
+}
+
 fn bands_of(it: &Value, source: &str) -> Bands {
     if source.starts_with("cdse") && level(source) == "l1c" {
         Bands {
@@ -85,7 +91,7 @@ fn bands_of(it: &Value, source: &str) -> Bands {
             b08: href(it, "B08"),
             b8a: href(it, "B8A"),
             b09: href(it, "B09"),
-            b10: href(it, "B10"),
+            b10: cdse_b10(it),
             b11: href(it, "B11"),
             b12: href(it, "B12"),
             scl: None,
@@ -253,6 +259,23 @@ pub fn search(
             None => break,
         }
     }
+
+    // cdse occasionally returns antimeridian tiles for queries anywhere on the
+    // globe (seen: pacific t01/t60 items for a uk point search, with degenerate
+    // [-179.57..180] bboxes that intersect everything). a stray scene computes a
+    // chip window half a world from its raster and ooms the box, so drop items
+    // whose bbox misses the query envelope or is wider than any real s2 tile.
+    features.retain(|it| {
+        it["bbox"].as_array().is_none_or(|b| {
+            let v: Vec<f64> = b.iter().filter_map(|x| x.as_f64()).collect();
+            v.len() != 4
+                || (v[2] - v[0] < 5.0
+                    && v[0] <= query_bbox[2]
+                    && v[2] >= query_bbox[0]
+                    && v[1] <= query_bbox[3]
+                    && v[3] >= query_bbox[1])
+        })
+    });
 
     // dedup by tile+date, keep lowest cloud.
     let mut best: std::collections::HashMap<String, (Value, f64)> =

@@ -11,6 +11,7 @@ core/                       pure compute; no I/O
   detect.rs                   flare methodology
   plume.rs                    registration, model tensors, components, retrieval
   cluster.rs score.rs         persistent-site view and scoring
+  review.rs                   plume-candidate triage verdicts
   coverage.rs geo.rs          cloud grid and geometry
 
 cli/                        native application
@@ -24,6 +25,7 @@ cli/                        native application
   models.rs                   Candle-native checkpoint definitions
   read.rs stac.rs             GDAL and catalogue I/O
   view.rs                     DuckDB-backed derived view I/O
+  review.rs                   retrievals-view triage → ranked curation list
   main.rs                     CLI and cluster orchestration
 
 wasm/                       the shared flare core for browser clients
@@ -87,6 +89,9 @@ view. They may always be deleted and rebuilt from `observations/`.
 - `cluster_detections` and scoring remain pure shared-core functions. Persistence
   uses distinct clear dates from the cloud grid and is a score term, not a hard
   count gate.
+- Plume triage (`triage`) is a pure-core precision layer over the disposable
+  retrievals view, never the canonical records. Max probability is a floor only,
+  never a ranking weight, and curation into `data/valid-plumes.txt` stays human.
 
 ## Execution
 
@@ -106,7 +111,10 @@ primitives come from `data-desk/infra/cloudferro.sh` and the bucket from
 `data-desk/infra/store.sh`; `box.sh` configures them through `CF_*`. Anything
 generic to CloudFerro belongs in that repo, not this one. The Rust `archive` command publishes canonical records, `views` rebuilds
 the disposable Parquet indexes, and `cluster` builds the cluster snapshot; the `etl`
-repo owns their scheduled cadence. No detector-specific shell plugins or alternate
+repo owns their scheduled cadence. `review` scores the retrievals view (wind
+consistency, fixed-offset recurrence, scene-day regimes, magnitude prior, scene
+hygiene, optional OSM-line collinearity against the probability assets) into a
+ranked candidate CSV for `data/valid-plumes.txt` curation. No detector-specific shell plugins or alternate
 orchestration paths are allowed.
 
 ## Checks

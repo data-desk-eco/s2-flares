@@ -246,6 +246,17 @@ pub fn derive_views(root: &str) -> Result<(), String> {
                json_extract_string(analysis,'$.scene.date') AS date, \
                json_extract_string(analysis,'$.scene.mgrs') AS mgrs, \
                json_extract_string(analysis,'$.scene.satellite') AS satellite, \
+               json_extract(analysis,'$.scene.sun_elevation')::DOUBLE AS sun_elevation, \
+               COALESCE(TRY_CAST(json_extract(analysis,'$.target.geometry.coordinates[0]') AS DOUBLE), \
+                 (json_extract(analysis,'$.area.requested.coordinates[0][0][0]')::DOUBLE + \
+                  json_extract(analysis,'$.area.requested.coordinates[0][2][0]')::DOUBLE) / 2) AS target_lon, \
+               COALESCE(TRY_CAST(json_extract(analysis,'$.target.geometry.coordinates[1]') AS DOUBLE), \
+                 (json_extract(analysis,'$.area.requested.coordinates[0][0][1]')::DOUBLE + \
+                  json_extract(analysis,'$.area.requested.coordinates[0][2][1]')::DOUBLE) / 2) AS target_lat, \
+               (json_extract(analysis,'$.scene.footprint.coordinates[0][2][0]')::DOUBLE - \
+                json_extract(analysis,'$.scene.footprint.coordinates[0][0][0]')::DOUBLE) AS scene_w_deg, \
+               (json_extract(analysis,'$.scene.footprint.coordinates[0][2][1]')::DOUBLE - \
+                json_extract(analysis,'$.scene.footprint.coordinates[0][0][1]')::DOUBLE) AS scene_h_deg, \
                json_extract_string(analysis,'$.status') AS status, \
                json_extract(analysis,'$.clear_percent')::DOUBLE AS clear_percent, \
                json_extract_string(analysis,'$.background_scene') AS background_scene, \

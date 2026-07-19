@@ -10,6 +10,7 @@ mod models;
 mod plume;
 mod read;
 mod record;
+mod review;
 mod stac;
 mod view;
 
@@ -105,6 +106,23 @@ enum Cmd {
     Views {
         #[arg(long, value_name = "ROOT")]
         root: String,
+    },
+    /// Deterministic plume triage: score views/retrievals (wind consistency,
+    /// fixed-offset recurrence, scene-day regimes, magnitude prior, scene
+    /// hygiene, optional OSM collinearity) into a ranked candidate list for
+    /// data/valid-plumes.txt curation. Never mutates canonical records; rerun
+    /// `views` first so the view carries the target/sun/footprint columns.
+    Review {
+        /// Store ROOT containing views/retrievals (local dir or s3:// prefix).
+        #[arg(long, value_name = "ROOT")]
+        root: String,
+        /// Linear features GeoJSON (OSM roads/boundaries/waterways/hedges) for
+        /// the collinearity check; reads probability assets under ROOT.
+        #[arg(long, value_name = "FILE")]
+        lines: Option<String>,
+        /// Output CSV (default stdout).
+        #[arg(long, value_name = "FILE")]
+        out: Option<String>,
     },
 }
 
@@ -426,6 +444,10 @@ fn main() {
         Cmd::Views { root } => {
             archive::derive_views(root).unwrap_or_else(|e| die(&format!("views: {e}")));
             println!("views ready: {root}");
+        }
+        Cmd::Review { root, lines, out } => {
+            review::run(root, lines.as_deref(), out.as_deref())
+                .unwrap_or_else(|e| die(&format!("review: {e}")));
         }
     }
 }
