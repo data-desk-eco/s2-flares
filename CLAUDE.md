@@ -112,9 +112,10 @@ primitives come from `data-desk/infra/cloudferro.sh` and the bucket from
 generic to CloudFerro belongs in that repo, not this one. The Rust `archive` command publishes canonical records, `views` rebuilds
 the disposable Parquet indexes, and `cluster` builds the cluster snapshot; the `etl`
 repo owns their scheduled cadence. `review` scores the retrievals view (wind
-consistency, fixed-offset recurrence, scene-day regimes, magnitude prior, scene
-hygiene, optional OSM-line collinearity against the probability assets) into a
-ranked candidate CSV for `data/valid-plumes.txt` curation. No detector-specific shell plugins or alternate
+consistency, fixed-offset recurrence, scene-day regimes, cross-orbit
+backgrounds, magnitude prior, scene hygiene, optional OSM-line collinearity
+against the probability assets) into a ranked candidate CSV for
+`data/valid-plumes.txt` curation. No detector-specific shell plugins or alternate
 orchestration paths are allowed.
 
 ## Checks

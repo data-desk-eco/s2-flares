@@ -295,7 +295,19 @@ pub fn search(
             .or_else(|| it["id"].as_str())
             .unwrap_or("")
             .to_string();
-        let key = format!("{tile}_{dt}");
+        // temporary experiment override: S2_KEEP_ORBITS=1 keys the dedup by
+        // orbit too, so same-day dual-look acquisitions both survive.
+        let orbit = if std::env::var("S2_KEEP_ORBITS").is_ok() {
+            it["id"]
+                .as_str()
+                .unwrap_or("")
+                .split('_')
+                .find(|t| t.len() == 4 && t.starts_with('R'))
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        let key = format!("{tile}_{dt}_{orbit}");
         match best.get(&key) {
             Some((_, c)) if *c <= cloud => {}
             _ => {
