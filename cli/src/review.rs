@@ -24,7 +24,7 @@ pub fn run(root: &str, lines: Option<&str>, out: Option<&str>) -> Result<(), Str
            json_extract(geometry,'$.coordinates[0][0][1]')::DOUBLE AS gs, \
            json_extract(geometry,'$.coordinates[0][2][0]')::DOUBLE AS ge, \
            json_extract(geometry,'$.coordinates[0][2][1]')::DOUBLE AS gn, \
-           scene_w_deg, scene_h_deg, probability_asset \
+           scene_w_deg, scene_h_deg, probability_asset, background_scene \
          FROM read_parquet('{base}/views/retrievals/*.parquet') \
          WHERE detected AND status='ok') TO '{tmp_s}' (FORMAT CSV, HEADER)",
         p = view::s3_prelude()
@@ -81,6 +81,10 @@ pub fn run(root: &str, lines: Option<&str>, out: Option<&str>) -> Result<(), Str
             clear_percent: num(11).unwrap_or(100.0),
             sun_elevation: num(10),
             swath_edge: w_km.min(h_km) < SWATH_MIN_KM,
+            cross_orbit_bg: {
+                let (s, b) = (orbit(v[3]), orbit(v.get(21).copied().unwrap_or("")));
+                !s.is_empty() && !b.is_empty() && s != b
+            },
             collinearity,
         });
     }

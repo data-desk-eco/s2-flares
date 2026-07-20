@@ -118,6 +118,20 @@ ranked by expected value over the uk:
    = most similar surface state) and change *masking* (embedding distance
    flags surface-change pixels to exclude). not for the retrieval itself.
 
+## addendum (2026-07-20): experiment ran — see experiments/uk-ch4mf/RESULTS.md
+
+- ch4mf fp gate passed (0/26 rejected pairs at t≥4, max artefact t 3.61); tp
+  gate not passed (barrow t≈2.2 — the detector's composite-background noise is
+  ~6× the single-pair floor; precision-only at uk noise).
+- barrow 2026-03-14 was challenged and survived physics review (~90% real,
+  flux ~2–10 t/h): clean same-orbit mbmp is the only negative among null
+  day-pairs, the model rejects the 04-13 artefact-replica input, and a remit
+  umm outage (13–15 mar, flows 31→2 GWh/d) corroborates pulsed venting.
+- new mechanism found: **cross-orbit backgrounds** (published nearest-date
+  selection is orbit-blind) inject ±2% brdf mbmp fields — this is the
+  scene-day-regime engine and inflated barrow's quantification. `review` now
+  flags cross-orbit-bg records; `S2_KEEP_ORBITS=1` enables dual-look runs.
+
 ## cdse quirks fixed during the run (already in cli/src/stac.rs)
 
 - pre-2026 l1c stac items omit the B10 asset; derived from B11's href.

@@ -40,6 +40,11 @@ pub struct PlumeCandidate {
     pub clear_percent: f64,
     pub sun_elevation: Option<f64>,
     pub swath_edge: bool,
+    /// background scene from a different relative orbit than the scene: the
+    /// pairing views the surface from another angle, and spectrally uneven
+    /// brdf injects ±2% mbmp fields — plume-sized artefacts (barrow null test:
+    /// the no-event 04-13 R037→R080 pair reproduced the event signature).
+    pub cross_orbit_bg: bool,
     /// osm linear-feature score: buffered-overlap fraction × principal-axis
     /// alignment (None when no lines or pixel asset were available).
     pub collinearity: Option<f64>,
@@ -160,6 +165,9 @@ pub fn triage(c: &[PlumeCandidate]) -> Vec<Verdict> {
             if x.swath_edge {
                 flagged.push(("swath-edge", 0.1));
             }
+            if x.cross_orbit_bg {
+                flagged.push(("cross-orbit-bg", 0.25));
+            }
             let score = if rejects.is_empty() {
                 (1.0 - flagged.iter().map(|f| f.1).sum::<f64>()).max(0.0)
             } else {
@@ -204,6 +212,7 @@ mod tests {
             clear_percent: 100.0,
             sun_elevation: Some(35.0),
             swath_edge: false,
+            cross_orbit_bg: false,
             collinearity: Some(0.05),
         }
     }
@@ -275,6 +284,15 @@ mod tests {
         b.target = "holford".into();
         let v = triage(&[a, b]);
         assert!(v.iter().all(|x| x.flags == ["scene-regime"]));
+    }
+
+    #[test]
+    fn cross_orbit_background_is_flagged() {
+        let mut x = clean("barrow:2026-03-14:plume-1", "2026-03-14");
+        x.cross_orbit_bg = true; // r080 scene differenced against an r037 look
+        let v = triage(&[x]);
+        assert_eq!(v[0].flags, ["cross-orbit-bg"]);
+        assert!(v[0].rejects.is_empty()); // flag, not veto: barrow itself is real
     }
 
     #[test]
