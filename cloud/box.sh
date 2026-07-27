@@ -29,7 +29,11 @@ fi
 : "${OUT:=out}"                 # box-side output dir (one durable record per acquisition)
 : "${LOCAL_DATA:=../data/cf}"   # where `pull` lands the CSVs
 DD=${DATA_DESK:-$HOME/Tools/data-desk}
-. "$DD/store.sh"                # the shared datadesk store (bucket/region/creds)
+. "$DD/infra/store.sh"          # the shared datadesk store (bucket/region/creds), which
+                                # pulls in infra/cloudferro.sh: cf_login and the vm primitives
+# hand our naming to the shared cloudferro layer; it owns the openstack calls
+export CF_KEYPAIR=$KEYPAIR CF_KEYFILE=$KEYFILE CF_SECGROUP=$SECGROUP \
+       CF_NET=$NET CF_EXTNET=$EXTNET CF_FLAVOR=$FLAVOR CF_USERDATA=$CLOUD_INIT
 : "${BUCKET:=$STORE_BUCKET}"    # CloudFerro object-storage container for `archive`
 : "${RATE:=0.066}"              # eo1.large pay-per-use €/h (WAW3-2); override per flavor
 
@@ -49,51 +53,32 @@ mssh(){ local i=$1; shift; ssh $SSHOPTS -i "$KEYFILE" "eouser@$(mip "$i")" "$@";
 fleetn(){ cat .fleet 2>/dev/null || echo "$FLEET"; }
 boxip(){ mip "${1:-0}"; }       # head IP
 sshx(){ mssh 0 "$@"; }          # single-box convenience (parity / head ops)
-# project S3 (EC2) creds for our own buckets — list, minting one if none. "ak sk".
-s3creds(){
-  local c; c=$(openstack ec2 credentials list -f json | jq -r '.[0]|"\(.Access) \(.Secret)"' 2>/dev/null || true)
-  { [ -z "${c:-}" ] || [ "$c" = "null null" ]; } && { openstack ec2 credentials create >/dev/null; c=$(openstack ec2 credentials list -f json | jq -r '.[0]|"\(.Access) \(.Secret)"'); }
-  echo "$c"
-}
+# S3 (EC2) credentials come from the shared store: store_creds mints or reuses one
+# and exports AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
 
 auth(){
-  [ -n "${OS_TOKEN:-}" ] && return 0   # reuse the session within one invocation (one TOTP use)
-  store_login   # from store.sh: keycloak password+totp -> keystone token, creds from $DD/.env
-  [ -n "${OS_TOKEN:-}" ] || { echo "auth failed: no keystone token — wrong password/TOTP (check .env), or token-issue rejected" >&2; exit 1; }
+  cf_login || exit 1   # cf_login is a no-op once a session is open (a TOTP is single-use)
 }
 
-# idempotently ensure shared infra: keypair, ssh-only secgroup, private net + router.
-infra(){
-  say "Keypair $KEYPAIR"
-  [ -f "$KEYFILE" ] || ssh-keygen -t ed25519 -N '' -f "$KEYFILE" >/dev/null
-  openstack keypair show "$KEYPAIR" >/dev/null 2>&1 || openstack keypair create --public-key "$KEYFILE.pub" "$KEYPAIR" >/dev/null
-  say "Security group $SECGROUP"
-  openstack security group show "$SECGROUP" >/dev/null 2>&1 || {
-    openstack security group create "$SECGROUP" >/dev/null
-    openstack security group rule create --proto tcp --dst-port 22 --remote-ip 0.0.0.0/0 "$SECGROUP" >/dev/null; }
-  say "Network $NET"
-  openstack network show "$NET" >/dev/null 2>&1 || {
-    openstack network create "$NET" >/dev/null
-    openstack subnet create --network "$NET" --subnet-range 10.0.42.0/24 --dns-nameserver 8.8.8.8 "$NET-sub" >/dev/null
-    openstack router create "$NET-rtr" >/dev/null
-    openstack router set --external-gateway "$EXTNET" "$NET-rtr" >/dev/null
-    openstack router add subnet "$NET-rtr" "$NET-sub" >/dev/null; }
-}
+# keypair, ssh-only secgroup, private net + router — all in the shared cloudferro layer
+infra(){ say "Scaffolding $KEYPAIR / $SECGROUP / $NET"; cf_infra; }
+
 # pick the boot image: explicit IMAGE wins; else the golden $BASEIMG snapshot if baked
 # (warm <1min boot); else the stock distro (cold build). needs auth (a glance lookup).
 resolve_image(){
   [ -n "$IMAGE" ] && return
-  if openstack image show "$BASEIMG" >/dev/null 2>&1; then IMAGE=$BASEIMG; say "Image $BASEIMG (golden → fast boot)"
-  else IMAGE=$BASEOS; say "Image $BASEOS (no golden image — cold build; bake one with ./box.sh image)"; fi
+  IMAGE=$(cf_image_or "$BASEIMG" "$BASEOS")
+  [ "$IMAGE" = "$BASEIMG" ] && say "Image $BASEIMG (golden → fast boot)" \
+    || say "Image $BASEOS (no golden image — cold build; bake one with ./box.sh image)"
 }
 
 # provision shared infra, then boot the FLEET in parallel (idempotent; reuses members).
 up(){
-  auth; infra; resolve_image
-  local netid eoid; netid=$(openstack network show "$NET" -f value -c id); eoid=$(openstack network show "$EODATANET" -f value -c id)
+  auth; infra; resolve_image; export CF_IMAGE=$IMAGE
+  local eoid; eoid=$(cf_netid "$EODATANET")
   say "Booting fleet of $FLEET ($FLAVOR) in parallel — a few minutes…"
   local i; local -a pids=()
-  for i in $(seq 0 $((FLEET-1))); do boot_member "$i" "$netid" "$eoid" & pids+=("$!"); done
+  for i in $(seq 0 $((FLEET-1))); do boot_member "$i" "$eoid" & pids+=("$!"); done
   wait_all "${pids[@]}"
   printf '\n\033[1;32m✓ provisioned %s members\033[0m  →  ./box.sh ssh [i]\n' "$FLEET"
 }
@@ -102,38 +87,28 @@ up(){
 # creds + cloud-init state → snapshot to $BASEIMG → tear down. (see README)
 image(){
   auth; infra
-  local netid eoid; netid=$(openstack network show "$NET" -f value -c id); eoid=$(openstack network show "$EODATANET" -f value -c id)
-  IMAGE=$BASEOS
+  local eoid; eoid=$(cf_netid "$EODATANET")
+  IMAGE=$BASEOS; export CF_IMAGE=$IMAGE
   say "Baking $BASEIMG from $BASEOS — full cold install+build, ~8min…"
-  boot_member img "$netid" "$eoid"
+  boot_member img "$eoid"
   wait_ready img || { echo "cloud-init didn't finish on $(mvm img) — ./box.sh ssh img" >&2; return 1; }
   say "Stripping per-VM creds + cloud-init state, then snapshotting → $BASEIMG"
   mssh img 'sudo rm -f /etc/profile.d/eodata.sh && sudo cloud-init clean --logs'
-  openstack image delete "$BASEIMG" >/dev/null 2>&1 || true   # replace any prior bake
-  openstack server image create --name "$BASEIMG" --wait "$(mvm img)" >/dev/null
+  cf_snapshot "$(mvm img)" "$BASEIMG"   # replaces any prior bake
   down_member img; rm -f .box-ip-img
   printf '\n\033[1;32m✓ baked %s — every ./box.sh up now boots from it\033[0m\n' "$BASEIMG"
 }
 # one member: boot (idempotent) + attach a floating IP → .box-ip-<i>. run under `&`.
 boot_member(){
-  local i=$1 netid=$2 eoid=$3 vm; vm=$(mvm "$i")
-  openstack server show "$vm" >/dev/null 2>&1 || openstack server create "$vm" \
-    --flavor "$FLAVOR" --image "$IMAGE" --key-name "$KEYPAIR" --security-group "$SECGROUP" \
-    --nic net-id="$netid" --nic net-id="$eoid" --user-data "$CLOUD_INIT" --wait >/dev/null
-  local port fip
-  port=$(openstack port list --server "$vm" --network "$NET" -f value -c id | head -1)
-  fip=$(openstack floating ip list --port "$port" -f value -c "Floating IP Address" | head -1)
-  [ -n "$fip" ] || { fip=$(openstack floating ip create "$EXTNET" -f value -c floating_ip_address); openstack floating ip set --port "$port" "$fip" >/dev/null; }
+  local i=$1 eoid=$2 vm fip; vm=$(mvm "$i")
+  fip=$(cf_boot "$vm" "$eoid")     # second nic is eodata; CF_* carry the rest
   echo "$fip" > ".box-ip-$i"
   say "  [$i] $vm @ $fip"
 }
 
 ip(){
-  auth; local i port
-  for i in $(seq 0 $(($(fleetn)-1))); do
-    port=$(openstack port list --server "$(mvm "$i")" --network "$NET" -f value -c id | head -1)
-    openstack floating ip list --port "$port" -f value -c "Floating IP Address" | head -1 | tee ".box-ip-$i"
-  done
+  auth; local i
+  for i in $(seq 0 $(($(fleetn)-1))); do cf_fip "$(mvm "$i")" | tee ".box-ip-$i"; done
 }
 
 # interactive login to member ${1:-0}. `exec` so ssh doesn't slurp our stdin.
@@ -260,9 +235,8 @@ pull(){
 # Gather the fleet's immutable GeoJSON analysis records onto the head, publish them
 # unchanged, then let the native CLI rebuild disposable columnar views.
 archive(){
-  auth
-  openstack container show "$BUCKET" >/dev/null 2>&1 || { say "Bucket $BUCKET"; openstack container create "$BUCKET" >/dev/null; }
-  local ak sk; read -r ak sk < <(s3creds)
+  auth; store_ensure "$BUCKET"; store_creds
+  local ak=$AWS_ACCESS_KEY_ID sk=$AWS_SECRET_ACCESS_KEY
   local n i; n=$(fleetn)
   # Gather every durable scene record → head (workers cannot ssh each other).
   for ((i=1; i<n; i++)); do
@@ -326,9 +300,7 @@ PY
 # instant local cost estimate: FLEET × uptime × RATE (billing portal is daily, too
 # coarse for a run in flight). assumes auth; `cost` wraps it.
 costline(){
-  local t; t=$(openstack server show "$(mvm 0)" -f value -c created 2>/dev/null) || return 1
-  t=${t%Z}; t=${t%.*}; t=$(date -ju -f "%Y-%m-%dT%H:%M:%S" "$t" +%s 2>/dev/null || date -u -d "$t" +%s)
-  local h n; n=$(fleetn); h=$(echo "scale=2;($(date -u +%s)-$t)/3600" | bc)
+  local h n; h=$(cf_uptime_h "$(mvm 0)") || return 1; n=$(fleetn)
   printf '\033[1;36m→ %s× %s up %sh × €%s/h ≈ €%s\033[0m\n' "$n" "$FLAVOR" "$h" "$RATE" "$(echo "scale=2;$n*$h*$RATE"|bc)"
 }
 cost(){ auth; costline || echo "no fleet $VM-*" >&2; }
@@ -343,24 +315,9 @@ down(){
   printf '\n\033[1;32m✓ scaled to zero (%s members)\033[0m\n' "$n"
 }
 down_member(){
-  local i=$1 vm port fip="" cached=""; vm=$(mvm "$i"); cached=$(cat ".box-ip-$i" 2>/dev/null || true)
-  if ! openstack server show "$vm" >/dev/null 2>&1; then
-    if [ -n "$cached" ]; then openstack floating ip delete "$cached" >/dev/null 2>&1 || true; fi
-    say "  [$i] no VM $vm"
-    return 0
-  fi
-  port=$(openstack port list --server "$vm" --network "$NET" -f value -c id 2>/dev/null | head -1 || true)
-  [ -n "$port" ] && fip=$(openstack floating ip list --port "$port" -f value -c "Floating IP Address" | head -1 || true)
-  if ! openstack server delete "$vm" --wait >/dev/null 2>&1; then
-    echo "  [$i] failed to delete $vm; address metadata retained" >&2
-    return 1
-  fi
+  local i=$1 vm cached; vm=$(mvm "$i"); cached=$(cat ".box-ip-$i" 2>/dev/null || true)
+  cf_delete "$vm" "$cached" || { echo "  [$i] address metadata retained" >&2; return 1; }
   say "  [$i] $vm deleted"
-  if [ -n "$fip" ] && ! openstack floating ip delete "$fip" >/dev/null 2>&1; then
-    echo "  [$i] VM deleted but floating IP $fip remains; address metadata retained" >&2
-    return 1
-  fi
-  return 0
 }
 
 # Prove a run is complete + clean per member before archive: the detector is stopped

@@ -41,13 +41,18 @@ to rebuild the disposable Parquet indexes.
 
 Only GeoJSON analysis records and their referenced assets are authoritative.
 Deleting and rebuilding the Parquet products loses no detector output. The full
-store layout, producers and cadence live in `data-desk/DATASETS.md`; bucket
-config (public-read + CORS) is `data-desk/store.sh publish`.
+store layout, producers and cadence live in `data-desk/docs/archive/`; bucket
+config (public-read + CORS) is `data-desk/infra/store.sh publish`.
 
 ## Infrastructure
 
 Cloud-init installs Rust, GDAL, DuckDB and awscli. Per-VM `/vsis3/eodata`
 credentials are written from metadata at boot. Model files are cached and checked
-against hashes pinned in `cli/src/models.rs`. OpenStack operations use the 2FA
-openrc vendored in `data-desk/`, whose `.env` can provide `CLOUDFERRO_PASSWORD`
-and `CLOUDFERRO_TOTP_SECRET` for non-interactive operation.
+against hashes pinned in `cli/src/models.rs`.
+
+This script owns the fleet — sharding, the detector run, verification, archive —
+and nothing about CloudFerro itself. The session and the VM primitives come from
+`data-desk/infra/cloudferro.sh` (`cf_login`, `cf_boot`, `cf_delete`, and the
+rest), the bucket from `data-desk/infra/store.sh`. `box.sh` hands its own naming
+down through `CF_*` and makes no OpenStack calls of its own. Credentials live in
+`data-desk/.env`; see that repo's `docs/infrastructure.md`.

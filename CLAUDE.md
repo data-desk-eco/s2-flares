@@ -101,7 +101,10 @@ match. Errors remain retryable `.err` files and successful commits remove them.
 Positive probability rasters are committed before their referencing GeoJSON.
 
 CloudFerro's `box.sh` only provisions, syncs, builds, shards, launches, gathers and
-tears down. The Rust `archive` command publishes canonical records, `views` rebuilds
+tears down — and it makes no OpenStack calls itself. The session and the VM
+primitives come from `data-desk/infra/cloudferro.sh` and the bucket from
+`data-desk/infra/store.sh`; `box.sh` configures them through `CF_*`. Anything
+generic to CloudFerro belongs in that repo, not this one. The Rust `archive` command publishes canonical records, `views` rebuilds
 the disposable Parquet indexes, and `cluster` builds the cluster snapshot; the `etl`
 repo owns their scheduled cadence. No detector-specific shell plugins or alternate
 orchestration paths are allowed.
