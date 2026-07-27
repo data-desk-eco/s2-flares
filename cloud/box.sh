@@ -58,16 +58,7 @@ s3creds(){
 
 auth(){
   [ -n "${OS_TOKEN:-}" ] && return 0   # reuse the session within one invocation (one TOTP use)
-  [ -f "$DD/.env" ] && . "$DD/.env"
-  set +eu   # the vendored openrc is written for a lax shell (unset OS_* refs, own `return`s)
-  if [ -n "${CLOUDFERRO_TOTP_SECRET:-}" ] && command -v oathtool >/dev/null; then
-    source "$DD/openrc-2fa.sh" >/dev/null \
-      < <(printf '%s\n%s\n' "${CLOUDFERRO_PASSWORD:-}" "$(oathtool -b --totp "$CLOUDFERRO_TOTP_SECRET")")
-  else
-    source "$DD/openrc-2fa.sh"
-  fi
-  set -eu
-  unset IFS   # the openrc leaves IFS=$'\n'; restore default splitting (else `ssh $SSHOPTS` collapses to one arg)
+  store_login   # from store.sh: keycloak password+totp -> keystone token, creds from $DD/.env
   [ -n "${OS_TOKEN:-}" ] || { echo "auth failed: no keystone token — wrong password/TOTP (check .env), or token-issue rejected" >&2; exit 1; }
 }
 
