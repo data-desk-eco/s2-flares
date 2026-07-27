@@ -396,6 +396,6 @@ case "${1:-}" in
   up) up;; image) image;; ip) ip;; ssh) shift; go_ssh "${1:-0}";; cost) cost;; down) down;;
   run) shift; run "$@";; watch) watch;; status) status;; pull) pull;; archive) archive;; verify) verify;; parity) parity;;
   coverage) shift; coverage "${1:-}";; launch) shift; launch "$@";; all) shift; all "$@";; aoi) shift; aoi "$@";;
-  publish) echo "bucket config moved: \$DATA_DESK/store.sh publish" >&2; exit 1;;
+  publish) echo "bucket config moved: \$DATA_DESK/infra/store.sh publish" >&2; exit 1;;
   *) echo "usage: $0 {up | image | run <args> | launch <args> | watch | status | pull | archive | coverage [aoi] | aoi QUERY | verify | parity | cost | down | all <args> | ssh [i] | ip}  (FLEET=N, default 4; GPU=1 → gpu box)" >&2; exit 1;;
 esac
