@@ -42,7 +42,7 @@ to rebuild the disposable Parquet indexes.
 Only GeoJSON analysis records and their referenced assets are authoritative.
 Deleting and rebuilding the Parquet products loses no detector output. The full
 store layout, producers and cadence live in `data-desk/docs/archive/`; bucket
-config (public-read + CORS) is `data-desk/infra/store.sh publish`.
+config (public-read + CORS) is `data-desk/infra/archive.sh publish`.
 
 ## Infrastructure
 
