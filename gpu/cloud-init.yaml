@@ -1,9 +1,16 @@
 #cloud-config
-# gpu box: the cpu setup (rust + gdal + duckdb, clone, build) PLUS the CUDA toolkit +
-# nvJPEG2000, building the cli with --features gpu — the full-tile nvjpeg2000 reader.
+# the gpu development box: a full toolchain, a clone and a --features gpu build of
+# the cli — the full-tile nvJPEG2000 reader. this is deliberately NOT the generic
+# worker recipe in data-desk (infra/cloud-init.yaml), which only runs a released
+# binary: the gpu feature is not released, so this box has to build from source and
+# is therefore a one-off, not a fleet. bring one up with:
+#
+#   FLEET_NAME=s2e-gpu FLEET=1 CF_FLAVOR=vm.l40s.1 FLEET_OS='Ubuntu 22.04 NVIDIA' \
+#     CF_USERDATA=$PWD/gpu/cloud-init.yaml ~/data-desk/infra/fleet.sh up
+#
 # the "Ubuntu 22.04 NVIDIA" image already ships the vGPU driver (libcuda), so we add
 # only the toolkit (nvcc/cudart/headers) and the nvjpeg2000 redistributable on top.
-# everything else (eodata per-VM creds, duckdb for archive) is identical to the cpu box.
+# eodata per-VM creds and duckdb are as on any other box.
 package_update: true
 packages: [git, gdal-bin, libgdal-dev, clang, libclang-dev, pkg-config, build-essential, ca-certificates, curl, unzip, python3, jq, awscli]
 runcmd:

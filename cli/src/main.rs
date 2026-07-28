@@ -1,6 +1,8 @@
 //! Native Sentinel-2 emissions CLI. `detect` writes independent canonical GeoJSON
 //! flare, plume and cloud analyses; `archive` publishes them unchanged and rebuilds
-//! disposable columnar views; `cluster` derives persistent flare sites.
+//! disposable columnar views; `cluster` derives persistent flare sites. `--shard`,
+//! `verify` and `coverage` are what a fleet needs, so the orchestrator can stay
+//! generic and hold no knowledge of the record layout.
 
 mod archive;
 mod detect;
@@ -12,6 +14,7 @@ mod read;
 mod record;
 mod review;
 mod stac;
+mod verify;
 mod view;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
@@ -124,6 +127,34 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         out: Option<String>,
     },
+    /// Prove a detect output is complete before it is archived: every requested
+    /// AOI feature has a durable record and no retryable `.err` remains. Exits
+    /// non-zero on a gap, which is a fleet's signal to re-run rather than tear down.
+    Verify {
+        /// Detection output containing observations/.
+        #[arg(long, value_name = "DIR", default_value = "out")]
+        input: String,
+        /// The AOI the run was given; omit for a bbox/region run.
+        #[arg(long, value_name = "FILE")]
+        aoi: Option<String>,
+        /// Check only this member's slice, exactly as passed to `detect`.
+        #[arg(long, value_name = "I/N", value_parser = parse_shard)]
+        shard: Option<(usize, usize)>,
+    },
+    /// Merge a scanned AOI into the published web/coverage.geojson under ROOT.
+    Coverage {
+        /// Store ROOT holding web/ (local dir or s3:// prefix).
+        #[arg(long, value_name = "ROOT")]
+        root: String,
+        /// The AOI that was scanned.
+        #[arg(long, value_name = "FILE")]
+        aoi: String,
+        /// The window it was scanned over, stamped onto each entry.
+        #[arg(long, value_name = "Y-M-D", default_value = "2015-01-01")]
+        start: String,
+        #[arg(long, value_name = "Y-M-D", default_value = "2100-01-01")]
+        end: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -143,6 +174,10 @@ struct Common {
     /// AOI geojson FeatureCollection (one run per feature).
     #[arg(long, value_name = "FILE")]
     aoi: Option<String>,
+    /// Take only member I of an N-way round-robin split of --aoi, so a fleet can
+    /// share one file and each member work a balanced slice of it.
+    #[arg(long, value_name = "I/N", value_parser = parse_shard)]
+    shard: Option<(usize, usize)>,
     /// Wide-area: detect every MGRS tile intersecting this region over its WHOLE
     /// tile (not a window). The GPU reader's target — full-tile mapping, not points.
     #[arg(long, value_name = "W,S,E,N", value_parser = parse_bbox, allow_hyphen_values = true)]
@@ -227,6 +262,17 @@ impl Common {
     }
 }
 
+fn parse_shard(s: &str) -> Result<(usize, usize), String> {
+    let (i, n) = s.split_once('/').ok_or("expected I/N")?;
+    let parse = |x: &str| x.trim().parse::<usize>().map_err(|e| e.to_string());
+    let (i, n) = (parse(i)?, parse(n)?);
+    if i < n {
+        Ok((i, n))
+    } else {
+        Err("expected 0 <= I < N".into())
+    }
+}
+
 fn parse_bbox(s: &str) -> Result<[f64; 4], String> {
     let v: Vec<f64> = s
         .split(',')
@@ -278,6 +324,35 @@ fn geom_bbox(geom: &serde_json::Value) -> [f64; 4] {
     [w, s, e, n]
 }
 
+/// The features of an AOI file, each with its position in the WHOLE collection, so a
+/// shard's ids do not shift with fleet size. `--shard I/N` keeps every Nth from I.
+fn aoi_features(path: &str, shard: Option<(usize, usize)>) -> Vec<(usize, serde_json::Value)> {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| die(&format!("read aoi: {e}")));
+    let gj: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("parse aoi: {e}")));
+    let all = gj["features"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate();
+    match shard {
+        Some((i, n)) => all.skip(i).step_by(n).collect(),
+        None => all.collect(),
+    }
+}
+
+/// The record identity of an AOI feature: our own `id`, GEM's `ProjectID`, else
+/// its position. Detect, verify and coverage must all agree on this.
+fn feature_id(idx: usize, f: &serde_json::Value) -> String {
+    let p = &f["properties"];
+    p["id"]
+        .as_str()
+        .or_else(|| p["ProjectID"].as_str())
+        .map(String::from)
+        .unwrap_or_else(|| idx.to_string())
+}
+
 fn load_aois(c: &Common) -> Vec<Aoi> {
     // --region: one wide-area job, scenes detected over their whole tile (full_tile).
     if let Some(b) = c.region {
@@ -306,21 +381,11 @@ fn load_aois(c: &Common) -> Vec<Aoi> {
             properties: Default::default(),
         }];
     }
-    let text = fs::read_to_string(c.aoi.as_ref().unwrap())
-        .unwrap_or_else(|e| die(&format!("read aoi: {e}")));
-    let gj: serde_json::Value =
-        serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("parse aoi: {e}")));
-    let feats = gj["features"].as_array().cloned().unwrap_or_default();
-    feats
-        .iter()
-        .enumerate()
+    aoi_features(c.aoi.as_ref().unwrap(), c.shard)
+        .into_iter()
         .map(|(idx, f)| {
             let p = &f["properties"];
-            let id = p["id"]
-                .as_str()
-                .map(String::from)
-                .or_else(|| p["ProjectID"].as_str().map(String::from))
-                .unwrap_or_else(|| idx.to_string());
+            let id = feature_id(idx, &f);
             let name = p["name"]
                 .as_str()
                 .or_else(|| p["TerminalName"].as_str())
@@ -448,6 +513,31 @@ fn main() {
         Cmd::Review { root, lines, out } => {
             review::run(root, lines.as_deref(), out.as_deref())
                 .unwrap_or_else(|e| die(&format!("review: {e}")));
+        }
+        Cmd::Verify { input, aoi, shard } => {
+            let expected = aoi.as_deref().map(|path| {
+                aoi_features(path, *shard)
+                    .iter()
+                    .map(|(idx, f)| feature_id(*idx, f))
+                    .collect::<Vec<_>>()
+            });
+            if !verify::run(Path::new(input), expected.as_deref()) {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Coverage {
+            root,
+            aoi,
+            start,
+            end,
+        } => {
+            let features: Vec<(String, serde_json::Value)> = aoi_features(aoi, None)
+                .into_iter()
+                .map(|(idx, f)| (feature_id(idx, &f), f))
+                .collect();
+            let (merged, total) = archive::coverage(root, &features, start, end, &today())
+                .unwrap_or_else(|e| die(&format!("coverage: {e}")));
+            println!("coverage: {merged} scanned features merged → {total} total");
         }
     }
 }

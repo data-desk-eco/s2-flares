@@ -2,7 +2,8 @@
 
 The canonical Rust reference implementation for Sentinel-2 flare and methane-
 plume detection. Shared L1C ingestion, native CloudSEN/MARS-S2L inference, flare
-detection, methane retrieval, clustering and fleet execution live here once.
+detection, methane retrieval and clustering live here once. The detector only —
+the machines belong to `data-desk`, the schedules to `etl`.
 
 ## Architecture
 
@@ -28,9 +29,9 @@ cli/                        native application
   review.rs                   retrievals-view triage → ranked curation list
   main.rs                     CLI and cluster orchestration
 
+  verify.rs                   run completeness: every feature scanned, no errors left
 wasm/                       the shared flare core for browser clients
 gpu/                        optional CUDA/nvJPEG2000 reader, off by default
-cloud/                      thin CloudFerro lifecycle around the native CLI
 ```
 
 The `core/` boundary is typed slices in, results out. GDAL, HTTP, models, files and
@@ -105,25 +106,33 @@ record is cached only when its schema, detector, scene and method fingerprint al
 match. Errors remain retryable `.err` files and successful commits remove them.
 Positive probability rasters are committed before their referencing GeoJSON.
 
-CloudFerro's `box.sh` only provisions, syncs, builds, shards, launches, gathers and
-tears down — and it makes no OpenStack calls itself. The session and the VM
-primitives come from `data-desk/infra/cloudferro.sh` and the bucket from
-`data-desk/infra/store.sh`; `box.sh` configures them through `CF_*`. Anything
-generic to CloudFerro belongs in that repo, not this one. The Rust `archive` command publishes canonical records, `views` rebuilds
-the disposable Parquet indexes, and `cluster` builds the cluster snapshot; the `etl`
-repo owns their scheduled cadence. `review` scores the retrievals view (wind
-consistency, fixed-offset recurrence, scene-day regimes, cross-orbit
-backgrounds, magnitude prior, scene hygiene, optional OSM-line collinearity
-against the probability assets) into a ranked candidate CSV for
-`data/valid-plumes.txt` curation. No detector-specific shell plugins or alternate
-orchestration paths are allowed.
+Every operation over the record layout is a subcommand, never a script elsewhere.
+`archive` publishes canonical records, `views` rebuilds the disposable Parquet
+indexes, `cluster` builds the cluster snapshot, `verify` proves a run is complete
+and `coverage` maintains the published coverage overlay. `review` scores the
+retrievals view (wind consistency, fixed-offset recurrence, scene-day regimes,
+cross-orbit backgrounds, magnitude prior, scene hygiene, optional OSM-line
+collinearity against the probability assets) into a ranked candidate CSV for
+`data/valid-plumes.txt` curation.
+
+## What is not here
+
+Fleets and schedules are somebody else's. `data-desk`'s `infra/fleet.sh` boots N
+CloudFerro boxes, pushes a binary and a payload, launches, follows and tears down,
+and knows nothing about this detector. The `etl` repo's `s2e/` owns which AOI runs
+over which window, and the cadence. A run pins a tagged release fetched from the
+store, not a working tree.
+
+The seam is `--shard I/N`, `verify` and `coverage`: enough for a generic
+orchestrator to split, check and publish a run without ever parsing a record. Do
+not add a shell orchestrator, a detector plugin or an alternate execution path
+here; extend those three instead.
 
 ## Checks
 
 ```bash
 cargo fmt --all -- --check
 cargo test -p s2e-core -p s2e-cli -p s2e-wasm --no-default-features
-bash -n cloud/box.sh
 ```
 
 Network/model/GPU parity tests are ignored by default and require their documented
