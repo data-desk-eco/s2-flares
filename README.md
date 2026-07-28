@@ -1,9 +1,9 @@
 # s2e
 
 A native Rust reference implementation for detecting gas flares and methane
-plumes in Sentinel-2 imagery. Both modes share L1C scene search, CloudSEN masking,
-georeferencing and CloudFerro orchestration. Point and AOI runs default to both:
-a lit flare and an unlit methane source are two states of the same facility.
+plumes in Sentinel-2 imagery. Both modes share L1C scene search, CloudSEN masking
+and georeferencing. Point and AOI runs default to both: a lit flare and an unlit
+methane source are two states of the same facility.
 
 There is no Python detector runtime. Candle loads the published MARS-S2L and
 CloudSEN PyTorch checkpoints directly and verifies their pinned SHA-256 hashes.
@@ -12,8 +12,13 @@ CloudSEN PyTorch checkpoints directly and verifies their pinned SHA-256 hashes.
 core/   pure flare/plume compute, retrieval, clustering and geometry
 cli/    STAC + GDAL I/O, native models, GeoJSON records and archive views
 wasm/   the shared flare methodology exposed to browser clients
-cloud/  a thin CloudFerro fleet lifecycle around the same CLI
+gpu/    an optional CUDA/nvJPEG2000 reader, off by default
 ```
+
+This repository is the detector and nothing else. The machines it runs on belong
+to [data-desk](https://github.com/data-desk-eco/data-desk) (`infra/fleet.sh`), and
+the schedule on which they run belongs to
+[etl](https://github.com/data-desk-eco/etl) (`s2e/`).
 
 ## Why L1C
 
@@ -97,17 +102,41 @@ authoritative detection format.
 cargo test -p s2e-core -p s2e-cli -p s2e-wasm --no-default-features
 ```
 
-## CloudFerro
+## Running at scale
 
-`cloud/box.sh` provisions and shards the fleet, rsyncs this implementation, runs
-the same binary with `--source cdse-l1c`, gathers its immutable records and calls
-the native `archive` command on the head:
+Bulk runs happen on a CloudFerro fleet in WAW3-2, next to the Copernicus archive.
+Nothing about that fleet lives here. A tagged release publishes a Linux binary to
+the store, and the `etl` repo fetches it, spreads it over as many boxes as it wants
+and runs it:
 
 ```bash
-cloud/box.sh launch --mode both --aoi aoi/uk-gas-import-terminals.geojson \
-  --start 2026-01-01 --end 2026-07-17
-cloud/box.sh watch
-cloud/box.sh verify
-cloud/box.sh archive
-cloud/box.sh down
+make s2e-aoi NAME=lng AOI='kind=lng_terminal,status=operating'
+make s2e-run NAME=lng ARGS="--start 2026-01-01 --end 2026-07-17"
+```
+
+Three flags are what make that possible, and they are the only concession this CLI
+makes to being run by something else:
+
+- `--shard I/N` takes member `I` of an N-way split of `--aoi`, so every box works a
+  balanced slice of one shared file and no orchestrator has to cut it up.
+- `verify` proves a run is complete — every requested feature has a durable record,
+  no retryable `.err` is left — and exits non-zero if it is not.
+- `coverage` merges the scanned AOI into the map's published coverage overlay.
+
+Each of these needs to know how a record is laid out and how a feature is named, so
+each belongs here rather than in a shell script somewhere else.
+
+The optional GPU reader is a development box rather than a fleet, since it needs a
+`--features gpu` build from source. `gpu/cloud-init.yaml` is its recipe:
+
+```bash
+FLEET_NAME=s2e-gpu FLEET=1 CF_FLAVOR=vm.l40s.1 FLEET_OS='Ubuntu 22.04 NVIDIA' \
+  CF_USERDATA=$PWD/gpu/cloud-init.yaml ~/data-desk/infra/fleet.sh up
+```
+
+Then run the parity gate on it — nvJPEG2000 against GDAL/OpenJPEG over real scenes,
+which must agree byte for byte:
+
+```bash
+S2_PARITY_BBOX=W,S,E,N cargo test --release -p s2e-cli --features gpu parity -- --ignored --nocapture
 ```

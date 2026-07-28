@@ -1,14 +1,15 @@
 name: release
 
-# tag push → linux binary published to the store at bin/s2e (latest) and
-# bin/s2e-<tag> (pinned). the etl repo's views.yml runs it on cadence.
+# tag push → linux binary published to the store at ops/bin/s2e (latest) and
+# ops/bin/s2e-<tag> (pinned). the etl repo fetches it for both the weekly view
+# rebuild and every fleet run, so a run pins a release rather than a working tree.
 on:
   push:
     tags: ['v*']
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # must match the fleet box distro (data-desk infra/cloud-init.yaml)
     steps:
       - uses: actions/checkout@v6
       - run: sudo apt-get update && sudo apt-get install -y gdal-bin libgdal-dev clang libclang-dev
