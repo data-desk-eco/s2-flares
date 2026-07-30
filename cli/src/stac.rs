@@ -60,6 +60,15 @@ fn level(source: &str) -> &'static str {
     }
 }
 
+/// the L2A profile on the same catalogue, for borrowing a cloud mask.
+fn l2a_twin(source: &str) -> &'static str {
+    if source.starts_with("cdse") {
+        "cdse"
+    } else {
+        "aws"
+    }
+}
+
 fn href(it: &Value, key: &str) -> Option<String> {
     it["assets"][key]["href"].as_str().map(String::from)
 }
@@ -356,6 +365,28 @@ pub fn search(
             bands: bands_of(&it, source),
             level: level(source),
         });
+    }
+
+    // cloud is cloud. the scene classification (SCL) ships only with L2A, so a
+    // detector reading L1C radiometry had bands.scl = None and wrote an empty
+    // cloud mask for every scene — which is why ops/clouds carries almost nothing
+    // from the flare method and 9,595 of 9,603 clusters have no clear-sky
+    // denominator. the mask does not depend on the radiometry we detect in, so
+    // resolve it from the L2A twin of the same acquisition (same tile, same day)
+    // whatever --source asks for. a failed twin search degrades to no mask rather
+    // than failing the run, and scenes with no L2A counterpart (some pre-2018)
+    // keep scl: None — unrated, which is honest, not counted as clear.
+    if level(source) == "l1c" {
+        let twins = search(bbox, start, end, 100.0, l2a_twin(source)).unwrap_or_default();
+        let scl: std::collections::HashMap<String, String> = twins
+            .into_iter()
+            .filter_map(|t| t.bands.scl.map(|href| (format!("{}_{}", t.mgrs, t.date), href)))
+            .collect();
+        for it in out.iter_mut() {
+            if it.bands.scl.is_none() {
+                it.bands.scl = scl.get(&format!("{}_{}", it.mgrs, it.date)).cloned();
+            }
+        }
     }
     Ok(out)
 }
