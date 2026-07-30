@@ -106,7 +106,7 @@ cargo test -p s2e-core -p s2e-cli -p s2e-wasm --no-default-features
 
 Bulk runs happen on a CloudFerro fleet in WAW3-2, next to the Copernicus archive.
 Nothing about that fleet lives here. A tagged release publishes a Linux binary to
-the store, and the `etl` repo fetches it, spreads it over as many boxes as it wants
+the archive, and the `etl` repo fetches it, spreads it over as many boxes as it wants
 and runs it:
 
 ```bash

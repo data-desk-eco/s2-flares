@@ -121,7 +121,7 @@ Fleets and schedules are somebody else's. `data-desk`'s `infra/fleet.sh` boots N
 CloudFerro boxes, pushes a binary and a payload, launches, follows and tears down,
 and knows nothing about this detector. The `etl` repo's `s2e/` owns which AOI runs
 over which window, and the cadence. A run pins a tagged release fetched from the
-store, not a working tree.
+archive, not a working tree.
 
 The seam is `--shard I/N`, `verify` and `coverage`: enough for a generic
 orchestrator to split, check and publish a run without ever parsing a record. Do
