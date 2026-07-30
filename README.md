@@ -10,7 +10,7 @@ CloudSEN PyTorch checkpoints directly and verifies their pinned SHA-256 hashes.
 
 ```
 core/   pure flare/plume compute, retrieval, clustering and geometry
-cli/    STAC + GDAL I/O, native models, GeoJSON records and archive views
+cli/    STAC + GDAL I/O, native models, GeoJSON records and clustering
 wasm/   the shared flare methodology exposed to browser clients
 gpu/    an optional CUDA/nvJPEG2000 reader, off by default
 ```
@@ -43,9 +43,9 @@ target/release/s2e detect \
 target/release/s2e detect --mode plumes --bbox 53.79,39.35,53.81,39.37
 target/release/s2e detect --mode flares --region 51.4,25.8,51.7,26.1
 
-# Publish the canonical records unchanged, then rebuild disposable Parquet views.
+# Publish the canonical records unchanged. Turning them into Parquet is etl's
+# job (etl/s2e/views), so there is no `views` subcommand here.
 target/release/s2e archive --input out/uk --destination s3://bucket
-target/release/s2e views --root s3://bucket
 
 # Derive a flare-site view for another date window.
 target/release/s2e cluster \
@@ -84,9 +84,11 @@ methodology gets a new deterministic filename; retrying the same methodology
 idempotently commits the same path. Combined runs share computation in memory but
 retain this clean persistence boundary.
 
-`archive` copies GeoJSON and raster assets unchanged. `views` uses DuckDB to
-rebuild `views/detections/`, `ops/clouds/` and `views/retrievals/` as disposable query
-indexes. `clusters/` is likewise derived; none of the Parquet products is another
+`archive` copies GeoJSON and raster assets unchanged. The records stop there: the
+DuckDB transforms that rebuild `views/detections/`, `ops/clouds/` and
+`views/retrievals/` live in the etl repository (`etl/s2e/sql`), because they are a
+property of how the archive is published rather than of how detection works.
+`clusters/` is derived by `cluster`; none of the Parquet products is another
 authoritative detection format.
 
 ## Validation
