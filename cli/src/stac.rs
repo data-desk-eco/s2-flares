@@ -377,7 +377,13 @@ pub fn search(
     // than failing the run, and scenes with no L2A counterpart (some pre-2018)
     // keep scl: None — unrated, which is honest, not counted as clear.
     if level(source) == "l1c" {
-        let twins = search(bbox, start, end, 100.0, l2a_twin(source)).unwrap_or_default();
+        // propagate, don't degrade. post_page already retries transient failures
+        // STAC_ATTEMPTS times with backoff, so an Err here is a real outage — and
+        // swallowing it would hand back scenes with no mask, which write an EMPTY
+        // cloud record indistinguishable from "we looked and nothing was clear".
+        // a partial mask is the worst case of all: it undercounts n_clear_obs and
+        // silently OVERSTATES persistence. fail the run instead.
+        let twins = search(bbox, start, end, 100.0, l2a_twin(source))?;
         let scl: std::collections::HashMap<String, String> = twins
             .into_iter()
             .filter_map(|t| t.bands.scl.map(|href| (format!("{}_{}", t.mgrs, t.date), href)))
@@ -386,6 +392,16 @@ pub fn search(
             if it.bands.scl.is_none() {
                 it.bands.scl = scl.get(&format!("{}_{}", it.mgrs, it.date)).cloned();
             }
+        }
+        // a genuine gap, not a failure: L2A is not global before ~2018. those looks
+        // stay unrated (write_clouds records them status "unavailable"), but they
+        // are missing denominator, so say how many rather than letting it pass.
+        let missing = out.iter().filter(|it| it.bands.scl.is_none()).count();
+        if missing > 0 {
+            eprintln!(
+                "  cloud: {missing}/{} scenes have no l2a counterpart — unrated, not clear",
+                out.len()
+            );
         }
     }
     Ok(out)
