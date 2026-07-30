@@ -1,6 +1,6 @@
 //! Native Sentinel-2 emissions CLI. `detect` writes independent canonical GeoJSON
-//! flare, plume and cloud analyses; `archive` publishes them unchanged and rebuilds
-//! disposable columnar views; `cluster` derives persistent flare sites. `--shard`,
+//! flare, plume and cloud analyses; `archive` publishes them unchanged and
+//! `cluster` derives persistent flare sites from them. `--shard`,
 //! `verify` and `coverage` are what a fleet needs, so the orchestrator can stay
 //! generic and hold no knowledge of the record layout.
 
@@ -104,17 +104,11 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         destination: Option<String>,
     },
-    /// Rebuild the disposable detections/, clouds/ and plumes/ Parquet views
-    /// from the GeoJSON records under ROOT (local dir or s3:// prefix).
-    Views {
-        #[arg(long, value_name = "ROOT")]
-        root: String,
-    },
     /// Deterministic plume triage: score views/retrievals (wind consistency,
     /// fixed-offset recurrence, scene-day regimes, magnitude prior, scene
     /// hygiene, optional OSM collinearity) into a ranked candidate list for
-    /// data/valid-plumes.txt curation. Never mutates canonical records; rerun
-    /// `views` first so the view carries the target/sun/footprint columns.
+    /// valid-plume curation (etl/s2e/sql/valid-plumes.txt). Never mutates canonical
+    /// records; rebuild the views first so they carry target/sun/footprint.
     Review {
         /// Store ROOT containing views/retrievals (local dir or s3:// prefix).
         #[arg(long, value_name = "ROOT")]
@@ -506,10 +500,6 @@ fn main() {
                 .unwrap_or_else(|e| die(&format!("archive: {e}")));
             println!("archive ready: {destination}");
         }
-        Cmd::Views { root } => {
-            archive::derive_views(root).unwrap_or_else(|e| die(&format!("views: {e}")));
-            println!("views ready: {root}");
-        }
         Cmd::Review { root, lines, out } => {
             review::run(root, lines.as_deref(), out.as_deref())
                 .unwrap_or_else(|e| die(&format!("review: {e}")));
@@ -830,15 +820,18 @@ fn coverage_rescore(
         }
     }
     // n_clear_obs = |clear looks ∪ the site's own detection dates| (guarantees n_dates ⊆).
+    // only for sites the scan actually covered: with no clear looks the union is just
+    // the site's own lit dates, so set_observations would divide date_count by itself
+    // and publish a confident persistence of 1.0 for a site we never measured. leave
+    // those null, exactly as the fold-in join does when a cell has no mask rows.
     let mut rescored = 0usize;
     for cl in clusters.iter_mut() {
+        let Some(cd) = clear.get(&cl.id) else { continue };
         let mut dates: std::collections::HashSet<String> =
             cl.detections.iter().map(|d| d.date.clone()).collect();
-        if let Some(cd) = clear.get(&cl.id) {
-            dates.extend(cd.iter().cloned());
-            rescored += 1;
-        }
+        dates.extend(cd.iter().cloned());
         cl.set_observations(dates.len());
+        rescored += 1;
     }
     eprintln!(
         "coverage: rescored {rescored} / {} clusters with clear-sky persistence",
