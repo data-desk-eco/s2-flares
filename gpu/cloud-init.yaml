@@ -12,7 +12,11 @@
 # only the toolkit (nvcc/cudart/headers) and the nvjpeg2000 redistributable on top.
 # eodata per-VM creds and duckdb are as on any other box.
 package_update: true
-packages: [git, gdal-bin, libgdal-dev, clang, libclang-dev, pkg-config, build-essential, ca-certificates, curl, unzip, python3, jq, awscli]
+# awscli is deliberately absent, as it is in the generic worker recipe: it is in
+# universe, which these images do not reliably enable, and one package with no
+# installation candidate takes the whole list down with it. nothing here calls it —
+# s3 goes through the binary's own reader and GDAL's /vsis3.
+packages: [git, gdal-bin, libgdal-dev, clang, libclang-dev, pkg-config, build-essential, ca-certificates, curl, unzip, python3, jq]
 runcmd:
   - su - eouser -c 'curl -fsSL https://install.duckdb.org | bash'
   - ln -sf /home/eouser/.duckdb/cli/latest/duckdb /usr/local/bin/duckdb
@@ -30,7 +34,10 @@ runcmd:
   - su - eouser -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
   - su - eouser -c 'git clone https://github.com/data-desk-eco/s2e.git s2e && cd s2e && . $HOME/.cargo/env && . /etc/profile.d/cuda.sh && cargo build --release -p s2e-cli --features gpu'
   - ln -sf /home/eouser/s2e/target/release/s2e /usr/local/bin/s2e
-  # WAW3-2 eodata access: per-VM S3 keys + endpoint from the metadata service.
+  # WAW3-2 eodata access: per-VM S3 keys + endpoint from the metadata service. this
+  # block is a copy of the one in data-desk/infra/cloud-init.yaml, which is where it
+  # is maintained — cloud-init has no include for a local file, and a one-off box is
+  # not worth a mime assembly step. keep the two identical.
   - |
     curl -s http://169.254.169.254/openstack/latest/vendor_data2.json | python3 -c '
     import sys, json
