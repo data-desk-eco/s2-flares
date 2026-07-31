@@ -87,6 +87,12 @@ enum Cmd {
         /// Superseded by --clouds; kept to cross-check the fold-in. Needs a scene source.
         #[arg(long, value_name = "DIR")]
         coverage_scan: Option<String>,
+        /// Aggregate an existing --coverage-scan DIR without re-enumerating scenes.
+        /// The rescore reads the scan directory, not the catalogue, so re-publishing
+        /// from a finished scan does not need the per-tile STAC search at all — it
+        /// would page for an hour only to skip every scene it found.
+        #[arg(long, requires = "coverage_scan")]
+        coverage_reuse: bool,
         #[command(flatten)]
         c: Common,
     },
@@ -461,6 +467,7 @@ fn main() {
             score_threshold,
             clouds,
             coverage_scan,
+            coverage_reuse,
         } => {
             if archive.is_none() && c.bbox.is_none() && c.aoi.is_none() && c.region.is_none() {
                 die("cluster: provide --archive GLOB, or --bbox/--aoi/--region to detect fresh");
@@ -479,6 +486,7 @@ fn main() {
                 opts,
                 clouds,
                 coverage_scan,
+                *coverage_reuse,
                 &pool(c.concurrency),
             );
         }
@@ -567,6 +575,7 @@ fn run_cluster(
     mut opts: ClusterOptions,
     clouds: &Option<String>,
     coverage_scan: &Option<String>,
+    coverage_reuse: bool,
     pool: &rayon::ThreadPool,
 ) {
     let (start, end) = c.dates();
@@ -643,7 +652,7 @@ fn run_cluster(
     if let Some(glob) = clouds {
         clouds_rescore(glob, &start, &end, &mut clusters);
     } else if let (Some(dir), Some(arch)) = (coverage_scan, archive) {
-        coverage_rescore(c, arch, dir, &start, &end, &mut clusters, pool);
+        coverage_rescore(c, arch, dir, &start, &end, &mut clusters, pool, coverage_reuse);
     }
 
     match out {
@@ -742,6 +751,7 @@ fn coverage_rescore(
     end: &str,
     clusters: &mut [Cluster],
     pool: &rayon::ThreadPool,
+    reuse: bool,
 ) {
     const CLEAR_MAX: f64 = 0.10;
     let sites: Vec<Site> = clusters
@@ -755,6 +765,23 @@ fn coverage_rescore(
     if sites.is_empty() {
         return;
     }
+    // the aggregation below reads the scan DIRECTORY, not the catalogue, so a finished
+    // scan needs neither the search nor the reads: enumerating 139k scenes to skip every
+    // one of them cost an hour of stac paging and changed nothing. --coverage-reuse is
+    // the re-publish path. left off by default so a partial scan still resumes per scene.
+    if reuse {
+        let scanned = fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".csv"))
+                    .count()
+            })
+            .unwrap_or(0);
+        if scanned == 0 {
+            die(&format!("--coverage-reuse: no scanned scenes in {dir}/"));
+        }
+        eprintln!("coverage: reusing {scanned} scanned scenes in {dir}/ (no stac search)");
+    } else {
     // per-tile STAC search → the unique acquisitions that can see any anchor (the
     // clear-but-unlit looks the detection archive can't supply — its own denominator).
     let tiles = view::tile_bboxes(glob, start, end).unwrap_or_else(|e| die(&e));
@@ -793,6 +820,8 @@ fn coverage_rescore(
             let _ = fs::write(&path, body);
         })
     });
+    }
+
     // aggregate clear DATES per site id across the per-scene csvs (date is in the name).
     let mut clear: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
