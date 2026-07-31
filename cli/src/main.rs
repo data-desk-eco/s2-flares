@@ -754,6 +754,8 @@ fn coverage_rescore(
     reuse: bool,
 ) {
     const CLEAR_MAX: f64 = 0.10;
+    // a rate off a handful of looks is noise, not a rate — publish nothing instead.
+    const MIN_LOOKS: usize = 10;
     let sites: Vec<Site> = clusters
         .iter()
         .map(|c| Site {
@@ -822,13 +824,32 @@ fn coverage_rescore(
     });
     }
 
+    // the scan dir is windowless and resumable: it holds every scene ever scanned
+    // (2015→now), while the detections it is divided into cover whatever window was
+    // actually run — one year, for most tiles. counting all of it divides this year's
+    // detections by a decade of clear looks, which is how a flare lit on 54 of its 60
+    // clear looks published 18%. so a clear look only counts where the detector ran,
+    // and the evidence of a run is a detection somewhere in that tile that date: the
+    // scan file's own <mgrs>_<date> stem. tile-dates that produced nothing at all are
+    // lost with it, but those are overwhelmingly the ones too clouded to process.
+    let ran: std::collections::HashSet<String> = clusters
+        .iter()
+        .flat_map(|c| {
+            c.detections
+                .iter()
+                .map(move |d| format!("{}_{}", c.mgrs, d.date))
+        })
+        .collect();
     // aggregate clear DATES per site id across the per-scene csvs (date is in the name).
     let mut clear: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for ent in rd.flatten() {
             let name = ent.file_name().to_string_lossy().to_string();
-            let date = match name.strip_suffix(".csv").and_then(|s| s.rsplit_once('_')) {
+            let Some(stem) = name.strip_suffix(".csv").filter(|s| ran.contains(*s)) else {
+                continue;
+            };
+            let date = match stem.rsplit_once('_') {
                 Some((_, d)) => d.to_string(),
                 None => continue,
             };
@@ -859,6 +880,9 @@ fn coverage_rescore(
         let mut dates: std::collections::HashSet<String> =
             cl.detections.iter().map(|d| d.date.clone()).collect();
         dates.extend(cd.iter().cloned());
+        if dates.len() < MIN_LOOKS {
+            continue;
+        }
         cl.set_observations(dates.len());
         rescored += 1;
     }
