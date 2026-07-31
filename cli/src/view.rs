@@ -293,6 +293,17 @@ fn member_rows(clusters: &[Cluster]) -> String {
     lines.join("\n") + "\n"
 }
 
+// one row per (cluster, quarter) — duckdb nests these into `quarters`.
+fn quarter_rows(clusters: &[Cluster]) -> String {
+    let mut lines = vec!["cluster_id,quarter,observations".to_string()];
+    for c in clusters {
+        for q in &c.quarters {
+            lines.push(format!("{},{},{}", c.id, q.quarter, q.observations));
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
 /// write the cluster view. `.geojson` → rich FeatureCollection (rust). otherwise
 /// (a local `.parquet` or an `s3://…/clusters/…` path) → nested parquet via duckdb.
 pub fn write_view(clusters: &[Cluster], out: &str) -> Result<(), String> {
@@ -302,6 +313,9 @@ pub fn write_view(clusters: &[Cluster], out: &str) -> Result<(), String> {
     let members = tmp("members.csv");
     std::fs::write(&members, member_rows(clusters)).map_err(|e| format!("write members: {e}"))?;
     let m = members.to_string_lossy();
+    let quarters = tmp("quarters.csv");
+    std::fs::write(&quarters, quarter_rows(clusters)).map_err(|e| format!("write quarters: {e}"))?;
+    let q = quarters.to_string_lossy();
     // explicit column types → the view's parquet schema is invariant, regardless of
     // whether a run's values happen to be integer-valued (else duckdb infers bigint
     // for one file, double for the next, and a union over the prefix conflicts).
@@ -331,6 +345,17 @@ pub fn write_view(clusters: &[Cluster], out: &str) -> Result<(), String> {
            list(struct_pack(date := date, max_b12 := m_max_b12, peak_b11 := peak_b11, pixels := pixels, radiance := radiance, \
              sun_elevation := sun_elevation, sun_azimuth := sun_azimuth, lon := m_lon, lat := m_lat) ORDER BY date) AS detections \
          FROM read_csv('{m}', header=true, nullstr='', columns={cols}) GROUP BY cluster_id");
+    // the looks split by quarter, nested the same way — a second flat csv joined on
+    // the cluster id, so a reader windowing to some quarters sums the counts it is
+    // showing instead of prorating the total across them. null where the rescore
+    // measured nothing, exactly as `observations` is.
+    let grouped = format!(
+        "SELECT g.*, q.quarters FROM ({grouped}) g LEFT JOIN (\
+           SELECT cluster_id, list(struct_pack(quarter := quarter, observations := observations) \
+             ORDER BY quarter) AS quarters \
+           FROM read_csv('{q}', header=true, columns={{'cluster_id':'VARCHAR','quarter':'DATE','observations':'INTEGER'}}) \
+           GROUP BY cluster_id) q ON q.cluster_id = g.id"
+    );
     let prelude = s3_prelude();
     // a plain `.parquet` → one file, mgrs in the body. a clusters/ dir or s3 prefix →
     // one deterministic `mgrs=<tile>/data.parquet` PER TILE (mgrs in the path, not the
@@ -358,6 +383,7 @@ pub fn write_view(clusters: &[Cluster], out: &str) -> Result<(), String> {
     };
     let r = duckdb(&sql);
     let _ = std::fs::remove_file(&members);
+    let _ = std::fs::remove_file(&quarters);
     r
 }
 

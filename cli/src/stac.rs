@@ -386,7 +386,11 @@ pub fn search(
         let twins = search(bbox, start, end, 100.0, l2a_twin(source))?;
         let scl: std::collections::HashMap<String, String> = twins
             .into_iter()
-            .filter_map(|t| t.bands.scl.map(|href| (format!("{}_{}", t.mgrs, t.date), href)))
+            .filter_map(|t| {
+                t.bands
+                    .scl
+                    .map(|href| (format!("{}_{}", t.mgrs, t.date), href))
+            })
             .collect();
         for it in out.iter_mut() {
             if it.bands.scl.is_none() {

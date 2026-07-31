@@ -70,6 +70,26 @@ pub struct DedupedDet {
     pub lat: f64,
 }
 
+// "YYYY-MM-DD" → the first day of its calendar quarter.
+fn quarter_start(date: &str) -> Option<String> {
+    let m: u32 = date.get(5..7)?.parse().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    Some(format!("{}-{:02}-01", date.get(..4)?, (m - 1) / 3 * 3 + 1))
+}
+
+/// the looks measured in one calendar quarter — the persistence denominator,
+/// split so a reader can divide over the window it is showing rather than
+/// prorating the total across it.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct QuarterObs {
+    /// first day of the quarter, matching views/vnf/quarters.parquet's key.
+    pub quarter: String,
+    pub observations: u32,
+}
+
 /// a persistent flare site.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -93,6 +113,8 @@ pub struct Cluster {
     /// the persistence denominator itself: clear-sky looks at the site over the
     /// window the detector ran. published, not left to be divided back out.
     pub observations: Option<u32>,
+    /// `observations` by calendar quarter; empty where none were measured.
+    pub quarters: Vec<QuarterObs>,
     pub seasonal: bool,
     pub median_b12_b11_ratio: Option<f64>,
     pub min_sun_elevation: Option<f64>,
@@ -113,6 +135,27 @@ impl Cluster {
     /// persistence = n_dates / n_clear_obs); clamped ≥ date_count so persistence ∈
     /// (0,1]. single-sources the score formula (score_cluster) so the archive path
     /// matches the fresh-detect path — no second scoring implementation to drift.
+    /// the same measurement as `set_observations`, from the dates themselves, so
+    /// the per-quarter split comes with the total instead of being inferred later.
+    pub fn set_observation_dates<'a>(&mut self, dates: impl IntoIterator<Item = &'a str>) {
+        let mut by_q: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let mut n = 0usize;
+        for d in dates {
+            n += 1;
+            if let Some(q) = quarter_start(d) {
+                *by_q.entry(q).or_default() += 1;
+            }
+        }
+        self.quarters = by_q
+            .into_iter()
+            .map(|(quarter, observations)| QuarterObs {
+                quarter,
+                observations,
+            })
+            .collect();
+        self.set_observations(n);
+    }
+
     pub fn set_observations(&mut self, n_clear_obs: usize) {
         let n = n_clear_obs.max(self.date_count as usize);
         self.observations = if n > 0 { Some(n as u32) } else { None };
@@ -310,6 +353,7 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
                     None
                 },
                 observations: (cloud_free_count > 0).then_some(cloud_free_count as u32),
+                quarters: Vec::new(),
                 seasonal: is_seasonal(std::iter::once(det.date.as_str())),
                 median_b12_b11_ratio: median,
                 min_sun_elevation: min_sun,
@@ -442,6 +486,7 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
             last_date,
             persistence,
             observations: (has_obs && cloud_free_count > 0).then_some(cloud_free_count as u32),
+            quarters: Vec::new(),
             seasonal,
             median_b12_b11_ratio: median,
             min_sun_elevation: min_sun,
@@ -603,6 +648,35 @@ mod tests {
         // n_clear_obs clamped ≥ date_count → persistence ≤ 1.
         c.set_observations(1);
         assert!((c.persistence.unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    // the looks split by quarter: same total as set_observations, keyed on the first
+    // day of each calendar quarter, so a reader can divide over the window it shows.
+    #[test]
+    fn observation_dates_split_by_quarter() {
+        let mut c = Cluster {
+            date_count: 2,
+            ..Default::default()
+        };
+        c.set_observation_dates(
+            ["2025-01-02", "2025-03-31", "2025-04-01", "2025-12-30"]
+                .into_iter(),
+        );
+        assert_eq!(c.observations, Some(4));
+        let q: Vec<(&str, u32)> = c
+            .quarters
+            .iter()
+            .map(|q| (q.quarter.as_str(), q.observations))
+            .collect();
+        assert_eq!(
+            q,
+            vec![("2025-01-01", 2), ("2025-04-01", 1), ("2025-10-01", 1)]
+        );
+        // the quarters account for every look the total counts.
+        assert_eq!(
+            c.quarters.iter().map(|q| q.observations).sum::<u32>(),
+            c.observations.unwrap()
+        );
     }
 
     // score.test.mjs [8] — scoreThreshold drops low-quality clusters

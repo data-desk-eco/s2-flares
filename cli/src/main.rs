@@ -730,7 +730,7 @@ fn clouds_rescore(glob: &str, start: &str, end: &str, clusters: &mut [Cluster]) 
         };
         if hit {
             joined += 1;
-            cl.set_observations(dates.len());
+            cl.set_observation_dates(dates.iter().map(String::as_str));
             rescored += 1;
         }
     }
@@ -883,7 +883,7 @@ fn coverage_rescore(
         if dates.len() < MIN_LOOKS {
             continue;
         }
-        cl.set_observations(dates.len());
+        cl.set_observation_dates(dates.iter().map(String::as_str));
         rescored += 1;
     }
     eprintln!(
