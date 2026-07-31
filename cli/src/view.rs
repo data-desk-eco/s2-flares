@@ -242,7 +242,7 @@ fn fb(x: Option<bool>) -> String {
     x.map(|b| b.to_string()).unwrap_or_default()
 }
 
-const MEMBER_HEADER: &str = "cluster_id,mgrs,cluster_lon,cluster_lat,cluster_max_b12,cluster_avg_b12,cluster_radiance,detection_count,date_count,first_date,last_date,persistence,seasonal,median_b12_b11_ratio,min_sun_elevation,likely_glint,ratio_score,persistence_score,glint_penalty,total_score,max_ratio,min_glint,glint_suspect,date,m_max_b12,peak_b11,pixels,radiance,sun_elevation,sun_azimuth,m_lon,m_lat";
+const MEMBER_HEADER: &str = "cluster_id,mgrs,cluster_lon,cluster_lat,cluster_max_b12,cluster_avg_b12,cluster_radiance,detection_count,date_count,first_date,last_date,persistence,observations,seasonal,median_b12_b11_ratio,min_sun_elevation,likely_glint,ratio_score,persistence_score,glint_penalty,total_score,max_ratio,min_glint,glint_suspect,date,m_max_b12,peak_b11,pixels,radiance,sun_elevation,sun_azimuth,m_lon,m_lat";
 
 // one flat row per (cluster, member detection) — duckdb renests the member fields.
 fn member_rows(clusters: &[Cluster]) -> String {
@@ -261,6 +261,7 @@ fn member_rows(clusters: &[Cluster]) -> String {
             c.first_date.clone(),
             c.last_date.clone(),
             fo(c.persistence),
+            c.observations.map(|n| n.to_string()).unwrap_or_default(),
             c.seasonal.to_string(),
             fo(c.median_b12_b11_ratio),
             fo(c.min_sun_elevation),
@@ -307,7 +308,7 @@ pub fn write_view(clusters: &[Cluster], out: &str) -> Result<(), String> {
     let cols = "{'cluster_id':'VARCHAR','mgrs':'VARCHAR','cluster_lon':'DOUBLE','cluster_lat':'DOUBLE',\
         'cluster_max_b12':'DOUBLE','cluster_avg_b12':'DOUBLE','cluster_radiance':'DOUBLE','detection_count':'INTEGER',\
         'date_count':'INTEGER','first_date':'DATE','last_date':'DATE','persistence':'DOUBLE',\
-        'seasonal':'BOOLEAN','median_b12_b11_ratio':'DOUBLE','min_sun_elevation':'DOUBLE',\
+        'observations':'INTEGER','seasonal':'BOOLEAN','median_b12_b11_ratio':'DOUBLE','min_sun_elevation':'DOUBLE',\
         'likely_glint':'BOOLEAN','ratio_score':'DOUBLE','persistence_score':'DOUBLE',\
         'glint_penalty':'DOUBLE','total_score':'DOUBLE','max_ratio':'DOUBLE','min_glint':'DOUBLE',\
         'glint_suspect':'BOOLEAN','date':'DATE','m_max_b12':'DOUBLE','peak_b11':'DOUBLE',\
@@ -320,7 +321,8 @@ pub fn write_view(clusters: &[Cluster], out: &str) -> Result<(), String> {
            any_value(cluster_radiance) AS radiance, \
            any_value(detection_count) AS detection_count, any_value(date_count) AS date_count, \
            any_value(first_date) AS first_date, any_value(last_date) AS last_date, \
-           any_value(persistence) AS persistence, any_value(seasonal) AS seasonal, \
+           any_value(persistence) AS persistence, any_value(observations) AS observations, \
+           any_value(seasonal) AS seasonal, \
            any_value(median_b12_b11_ratio) AS median_b12_b11_ratio, any_value(min_sun_elevation) AS min_sun_elevation, \
            any_value(likely_glint) AS likely_glint, any_value(ratio_score) AS ratio_score, \
            any_value(persistence_score) AS persistence_score, any_value(glint_penalty) AS glint_penalty, \

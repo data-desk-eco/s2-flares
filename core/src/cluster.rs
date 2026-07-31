@@ -90,6 +90,9 @@ pub struct Cluster {
     pub first_date: String,
     pub last_date: String,
     pub persistence: Option<f64>,
+    /// the persistence denominator itself: clear-sky looks at the site over the
+    /// window the detector ran. published, not left to be divided back out.
+    pub observations: Option<u32>,
     pub seasonal: bool,
     pub median_b12_b11_ratio: Option<f64>,
     pub min_sun_elevation: Option<f64>,
@@ -112,6 +115,7 @@ impl Cluster {
     /// matches the fresh-detect path — no second scoring implementation to drift.
     pub fn set_observations(&mut self, n_clear_obs: usize) {
         let n = n_clear_obs.max(self.date_count as usize);
+        self.observations = if n > 0 { Some(n as u32) } else { None };
         self.persistence = if n > 0 {
             Some(self.date_count as f64 / n as f64)
         } else {
@@ -305,6 +309,7 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
                 } else {
                     None
                 },
+                observations: (cloud_free_count > 0).then_some(cloud_free_count as u32),
                 seasonal: is_seasonal(std::iter::once(det.date.as_str())),
                 median_b12_b11_ratio: median,
                 min_sun_elevation: min_sun,
@@ -436,6 +441,7 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
             first_date,
             last_date,
             persistence,
+            observations: (has_obs && cloud_free_count > 0).then_some(cloud_free_count as u32),
             seasonal,
             median_b12_b11_ratio: median,
             min_sun_elevation: min_sun,
