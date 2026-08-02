@@ -1,11 +1,11 @@
-//! the derived cluster *view* — never the archive. produced by a separate
-//! `s2e cluster` run over the detection archive (or a fresh detect), one row
-//! per cluster + a nested `detections` list column. the web map column-projects to
-//! read scalar columns only (cheap pins) and reclusters raw detections via wasm for
-//! custom windows; a journalist gets the rich geojson.
+//! the clustering step's i/o. duckdb owns the parquet+s3 reads and writes (the
+//! stated analytics layer); rust core owns the clustering. the seam is a flat
+//! csv handoff — no native parquet deps.
 //!
-//! duckdb owns the parquet+s3 i/o (the stated analytics/archive layer); rust core
-//! owns the clustering. the seam is a flat csv handoff — no native parquet deps.
+//! `cluster` is not a publisher: it reads the staging detections and the cloud
+//! mask, and writes one row per site and one row per detection that joined one.
+//! nothing here counts days, because only the caller holds both the detections
+//! and the observations and can count them over the same window.
 
 use s2e_core::{Cluster, Detection};
 use std::process::{Command, Stdio};
@@ -35,7 +35,7 @@ pub(crate) fn s3_prelude() -> String {
     if let Ok(ep) = std::env::var("S2_S3_ENDPOINT") {
         let g = |k| std::env::var(k).unwrap_or_default();
         // duckdb's archive creds are kept SEPARATE from AWS_* so the same process can
-        // also drive gdal /vsis3 against eodata (AWS_*) during the coverage scan: the
+        // also drive gdal /vsis3 against eodata (AWS_*) during a detect run: the
         // duckdb (project-bucket) creds come from S2_S3_* first, falling back to AWS_*.
         let key = |s2, aws| {
             let v = g(s2);
@@ -65,73 +65,64 @@ fn opt_f64(s: &str) -> Option<f64> {
     }
 }
 
-/// read detections from the archive (any duckdb-readable glob: local parquet/csv or
-/// s3://…/detections/**/*.parquet), optionally clipped to a bbox + date window.
-pub fn read_archive(
-    archive: &str,
-    bbox: Option<[f64; 4]>,
-    start: &str,
-    end: &str,
-) -> Result<Vec<Detection>, String> {
-    let out = tmp("dets.csv");
-    let out_s = out.to_string_lossy();
-    let mut wheres = vec![format!("date >= '{start}' AND date <= '{end}'")];
-    if let Some([w, s, e, n]) = bbox {
-        wheres.push(format!(
-            "lon >= {w} AND lon <= {e} AND lat >= {s} AND lat <= {n}"
-        ));
-    }
-    // hive_partitioning exposes the detections' `mgrs` path key so each cluster can
-    // inherit its anchor's tile → the view partitions by mgrs like the archive.
-    // `radiance` is newer than `pixels`/`warm_size` — a pre-fix archive lacks it, so the
-    // false-filtered template declares the column and union_by_name backfills NULL (→ 0)
-    // for legacy rows instead of duckdb erroring. (legacy `pixels` is still the old
-    // flooded count, though — re-detect for a clean volume.)
-    let sql = format!(
-        "{prelude}\
-         COPY (SELECT lon, lat, date, mgrs, max_b12, max_b11, b12_b11_ratio, pixels, sun_elevation, sun_azimuth, glint_score, radiance \
-         FROM (SELECT * FROM read_parquet('{archive}', union_by_name=true, hive_partitioning=true) \
-               UNION ALL BY NAME SELECT NULL::DOUBLE AS radiance WHERE false) WHERE {wheres}) \
-         TO '{out_s}' (FORMAT CSV, HEADER)",
-        prelude = s3_prelude(), wheres = wheres.join(" AND ")
-    );
-    duckdb(&sql)?;
-    let text = std::fs::read_to_string(&out).map_err(|e| format!("read dets: {e}"))?;
-    let _ = std::fs::remove_file(&out);
-
-    let mut dets = Vec::new();
-    for line in text.lines().skip(1) {
-        let f: Vec<&str> = line.split(',').collect();
-        if f.len() < 12 {
-            continue;
-        }
-        dets.push(Detection {
-            lon: f[0].parse().unwrap_or(0.0),
-            lat: f[1].parse().unwrap_or(0.0),
-            date: f[2].to_string(),
-            mgrs: f[3].to_string(),
-            max_b12: f[4].parse().unwrap_or(0.0),
-            peak_b11: opt_f64(f[5]),
-            b12_b11_ratio: opt_f64(f[6]),
-            pixels: f[7].parse().unwrap_or(0),
-            sun_elevation: opt_f64(f[8]),
-            sun_azimuth: opt_f64(f[9]),
-            glint_score: opt_f64(f[10]),
-            radiance: f[11].parse().unwrap_or(0.0),
-            ..Default::default()
-        });
-    }
-    Ok(dets)
+/// header name → field index. duckdb writes the header, so a row is addressed by
+/// name: a renamed or reordered SELECT then loses one field instead of shifting
+/// every field after it silently into the wrong place.
+pub(crate) fn columns(header: &str) -> std::collections::HashMap<&str, usize> {
+    header
+        .trim_end()
+        .split(',')
+        .enumerate()
+        .map(|(i, n)| (n, i))
+        .collect()
 }
 
-/// read the cloud mask (clouds/ glob/parquet: glon,glat,date,cloud_frac) over a date
-/// window, restricted to `cells` (grid indices round(lon/GRID_STEP), round(lat/GRID_STEP)):
-/// the semi-join runs INSIDE duckdb (tiny csv build side, mask side streams), so the
+/// the flare detections to cluster, over a date window. `id` comes back out on
+/// the membership, so the caller can label the row each detection came from.
+pub fn read_detections(path: &str, start: &str, end: &str) -> Result<Vec<Detection>, String> {
+    let out = tmp("dets.csv");
+    let out_s = out.to_string_lossy();
+    duckdb(&format!(
+        "{prelude}\
+         COPY (SELECT id, lon, lat, date, max_b12, max_b11, b12_b11_ratio, radiance, \
+           sun_elevation, glint_score FROM read_parquet('{path}') \
+           WHERE date >= '{start}' AND date <= '{end}') TO '{out_s}' (FORMAT CSV, HEADER)",
+        prelude = s3_prelude()
+    ))?;
+    let text = std::fs::read_to_string(&out).map_err(|e| format!("read dets: {e}"))?;
+    let _ = std::fs::remove_file(&out);
+    let mut lines = text.lines();
+    let cols = columns(lines.next().unwrap_or_default());
+    Ok(lines
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let f: Vec<&str> = line.split(',').collect();
+            let g = |n: &str| cols.get(n).and_then(|&i| f.get(i)).copied().unwrap_or("");
+            Detection {
+                id: g("id").to_string(),
+                lon: g("lon").parse().unwrap_or(0.0),
+                lat: g("lat").parse().unwrap_or(0.0),
+                date: g("date").to_string(),
+                max_b12: g("max_b12").parse().unwrap_or(0.0),
+                peak_b11: opt_f64(g("max_b11")),
+                b12_b11_ratio: opt_f64(g("b12_b11_ratio")),
+                radiance: g("radiance").parse().unwrap_or(0.0),
+                sun_elevation: opt_f64(g("sun_elevation")),
+                glint_score: opt_f64(g("glint_score")),
+                ..Default::default()
+            }
+        })
+        .collect())
+}
+
+/// read the cloud mask (lon,lat,date,cloud) over a date window, restricted to
+/// `cells` (grid indices round(lon/GRID_STEP), round(lat/GRID_STEP)): the
+/// semi-join runs INSIDE duckdb (tiny csv build side, mask side streams), so the
 /// result — which the duckdb cli materialises in full before printing — is
 /// O(anchor cells × dates), not O(mask). the unfiltered mask (~25 GB materialised)
 /// OOM-killed a 7 GB box even with 16 GB of swap.
 pub fn read_clouds(
-    glob: &str,
+    path: &str,
     start: &str,
     end: &str,
     cells: &std::collections::HashSet<(i64, i64)>,
@@ -146,10 +137,10 @@ pub fn read_clouds(
     std::fs::write(&cf, body).map_err(|e| format!("write cells: {e}"))?;
     let inv = (1.0 / s2e_core::GRID_STEP).round();
     let sql = format!(
-        "{prelude}SELECT DISTINCT glon, glat, date, cloud_frac \
-         FROM read_parquet('{glob}', union_by_name=true) \
+        "{prelude}SELECT DISTINCT lon, lat, date, cloud \
+         FROM read_parquet('{path}') \
          JOIN read_csv('{cf_s}', header=true, columns={{'i':'BIGINT','j':'BIGINT'}}) \
-           ON CAST(round(glon*{inv}) AS BIGINT)=i AND CAST(round(glat*{inv}) AS BIGINT)=j \
+           ON CAST(round(lon*{inv}) AS BIGINT)=i AND CAST(round(lat*{inv}) AS BIGINT)=j \
          WHERE date >= '{start}' AND date <= '{end}'",
         prelude = s3_prelude()
     );
@@ -175,6 +166,9 @@ pub fn read_clouds(
             f[0].parse().unwrap_or(0.0),
             f[1].parse().unwrap_or(0.0),
             f[2],
+            // a look we cannot read the cloud of is not a clear look: default it
+            // cloudy, so an unreadable mask shrinks the denominator rather than
+            // inflating every site's persistence.
             f[3].parse().unwrap_or(1.0),
         );
     }
@@ -185,43 +179,6 @@ pub fn read_clouds(
     } else {
         Err("duckdb exited non-zero".into())
     }
-}
-
-/// distinct mgrs tiles in the archive + each tile's detection bounding box — the
-/// per-tile STAC search areas for the coverage scan. reads the hive `mgrs` partition
-/// key (the per-tile rollup EXCLUDEs mgrs from the file body, keeps it as the path).
-pub fn tile_bboxes(
-    archive: &str,
-    start: &str,
-    end: &str,
-) -> Result<Vec<(String, [f64; 4])>, String> {
-    let out = tmp("tiles.csv");
-    let out_s = out.to_string_lossy();
-    let sql = format!(
-        "{prelude}COPY (SELECT mgrs, min(lon) AS w, min(lat) AS s, max(lon) AS e, max(lat) AS n \
-         FROM read_parquet('{archive}', hive_partitioning=true) \
-         WHERE date >= '{start}' AND date <= '{end}' GROUP BY mgrs) TO '{out_s}' (FORMAT CSV, HEADER)",
-        prelude = s3_prelude());
-    duckdb(&sql)?;
-    let text = std::fs::read_to_string(&out).map_err(|e| format!("read tiles: {e}"))?;
-    let _ = std::fs::remove_file(&out);
-    let mut v = Vec::new();
-    for line in text.lines().skip(1) {
-        let f: Vec<&str> = line.split(',').collect();
-        if f.len() < 5 || f[0].is_empty() {
-            continue;
-        }
-        v.push((
-            f[0].to_string(),
-            [
-                f[1].parse().unwrap_or(0.0),
-                f[2].parse().unwrap_or(0.0),
-                f[3].parse().unwrap_or(0.0),
-                f[4].parse().unwrap_or(0.0),
-            ],
-        ));
-    }
-    Ok(v)
 }
 
 fn fmt(x: f64) -> String {
@@ -238,173 +195,103 @@ fn fmt(x: f64) -> String {
 fn fo(x: Option<f64>) -> String {
     x.map(fmt).unwrap_or_default()
 }
-fn fb(x: Option<bool>) -> String {
-    x.map(|b| b.to_string()).unwrap_or_default()
+
+// the cluster row, named and typed once: the csv header and read_csv's column
+// map are both built from this, so the two cannot drift. the explicit types are
+// what keep the parquet schema invariant when a run's values happen to be
+// integral or a column comes out entirely null.
+const CLUSTER: [(&str, &str); 15] = [
+    ("id", "VARCHAR"),
+    ("lon", "DOUBLE"),
+    ("lat", "DOUBLE"),
+    ("score", "DOUBLE"),
+    ("flags", "VARCHAR"),
+    ("cluster_max_b12", "DOUBLE"),
+    ("cluster_avg_b12", "DOUBLE"),
+    ("cluster_radiance", "DOUBLE"),
+    ("median_b12_b11_ratio", "DOUBLE"),
+    ("min_sun_elevation", "DOUBLE"),
+    ("ratio_score", "DOUBLE"),
+    ("persistence_score", "DOUBLE"),
+    ("glint_penalty", "DOUBLE"),
+    ("max_ratio", "DOUBLE"),
+    ("min_glint", "DOUBLE"),
+];
+const MEMBER: [(&str, &str); 2] = [("id", "VARCHAR"), ("site_id", "VARCHAR")];
+
+// fixed width: a column added to CLUSTER without a value here fails to compile.
+fn cluster_row(c: &Cluster) -> [String; CLUSTER.len()] {
+    [
+        c.id.clone(),
+        fmt(c.lon),
+        fmt(c.lat),
+        fmt(c.total_score),
+        c.flags().join(";"),
+        fmt(c.max_b12),
+        fmt(c.avg_b12),
+        fmt(c.radiance),
+        fo(c.median_b12_b11_ratio),
+        fo(c.min_sun_elevation),
+        fmt(c.ratio_score),
+        fmt(c.persistence_score),
+        fmt(c.glint_penalty),
+        fo(c.max_ratio),
+        fo(c.min_glint),
+    ]
 }
 
-const MEMBER_HEADER: &str = "cluster_id,mgrs,cluster_lon,cluster_lat,cluster_max_b12,cluster_avg_b12,cluster_radiance,detection_count,date_count,first_date,last_date,persistence,observations,seasonal,median_b12_b11_ratio,min_sun_elevation,likely_glint,ratio_score,persistence_score,glint_penalty,total_score,max_ratio,min_glint,glint_suspect,date,m_max_b12,peak_b11,pixels,radiance,sun_elevation,sun_azimuth,m_lon,m_lat";
-
-// one flat row per (cluster, member detection) — duckdb renests the member fields.
-fn member_rows(clusters: &[Cluster]) -> String {
-    let mut lines = vec![MEMBER_HEADER.to_string()];
-    for c in clusters {
-        let head = [
-            c.id.clone(),
-            c.mgrs.clone(),
-            fmt(c.lon),
-            fmt(c.lat),
-            fmt(c.max_b12),
-            fmt(c.avg_b12),
-            fmt(c.radiance),
-            c.detection_count.to_string(),
-            c.date_count.to_string(),
-            c.first_date.clone(),
-            c.last_date.clone(),
-            fo(c.persistence),
-            c.observations.map(|n| n.to_string()).unwrap_or_default(),
-            c.seasonal.to_string(),
-            fo(c.median_b12_b11_ratio),
-            fo(c.min_sun_elevation),
-            fb(c.likely_glint),
-            fmt(c.ratio_score),
-            fmt(c.persistence_score),
-            fmt(c.glint_penalty),
-            fmt(c.total_score),
-            fo(c.max_ratio),
-            fo(c.min_glint),
-            c.glint_suspect.to_string(),
-        ]
-        .join(",");
-        for d in &c.detections {
-            lines.push(format!(
-                "{head},{},{},{},{},{},{},{},{},{}",
-                d.date,
-                fmt(d.max_b12),
-                fo(d.peak_b11),
-                d.pixels,
-                fmt(d.radiance),
-                fo(d.sun_elevation),
-                fo(d.sun_azimuth),
-                fmt(d.lon),
-                fmt(d.lat)
-            ));
-        }
-    }
-    lines.join("\n") + "\n"
+fn csv(cols: &[(&str, &str)], rows: impl Iterator<Item = String>) -> String {
+    std::iter::once(cols.iter().map(|c| c.0).collect::<Vec<_>>().join(","))
+        .chain(rows)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
-// one row per (cluster, quarter) — duckdb nests these into `quarters`.
-fn quarter_rows(clusters: &[Cluster]) -> String {
-    let mut lines = vec!["cluster_id,quarter,observations".to_string()];
-    for c in clusters {
-        for q in &c.quarters {
-            lines.push(format!("{},{},{}", c.id, q.quarter, q.observations));
-        }
-    }
-    lines.join("\n") + "\n"
+fn types(cols: &[(&str, &str)]) -> String {
+    let body: Vec<String> = cols.iter().map(|(n, t)| format!("'{n}':'{t}'")).collect();
+    format!("{{{}}}", body.join(","))
 }
 
-/// write the cluster view. `.geojson` → rich FeatureCollection (rust). otherwise
-/// (a local `.parquet` or an `s3://…/clusters/…` path) → nested parquet via duckdb.
-pub fn write_view(clusters: &[Cluster], out: &str) -> Result<(), String> {
-    if out.ends_with(".geojson") || out.ends_with(".json") {
-        return write_geojson(clusters, out);
-    }
-    let members = tmp("members.csv");
-    std::fs::write(&members, member_rows(clusters)).map_err(|e| format!("write members: {e}"))?;
-    let m = members.to_string_lossy();
-    let quarters = tmp("quarters.csv");
-    std::fs::write(&quarters, quarter_rows(clusters)).map_err(|e| format!("write quarters: {e}"))?;
-    let q = quarters.to_string_lossy();
-    // explicit column types → the view's parquet schema is invariant, regardless of
-    // whether a run's values happen to be integer-valued (else duckdb infers bigint
-    // for one file, double for the next, and a union over the prefix conflicts).
-    let cols = "{'cluster_id':'VARCHAR','mgrs':'VARCHAR','cluster_lon':'DOUBLE','cluster_lat':'DOUBLE',\
-        'cluster_max_b12':'DOUBLE','cluster_avg_b12':'DOUBLE','cluster_radiance':'DOUBLE','detection_count':'INTEGER',\
-        'date_count':'INTEGER','first_date':'DATE','last_date':'DATE','persistence':'DOUBLE',\
-        'observations':'INTEGER','seasonal':'BOOLEAN','median_b12_b11_ratio':'DOUBLE','min_sun_elevation':'DOUBLE',\
-        'likely_glint':'BOOLEAN','ratio_score':'DOUBLE','persistence_score':'DOUBLE',\
-        'glint_penalty':'DOUBLE','total_score':'DOUBLE','max_ratio':'DOUBLE','min_glint':'DOUBLE',\
-        'glint_suspect':'BOOLEAN','date':'DATE','m_max_b12':'DOUBLE','peak_b11':'DOUBLE',\
-        'pixels':'INTEGER','radiance':'DOUBLE','sun_elevation':'DOUBLE','sun_azimuth':'DOUBLE','m_lon':'DOUBLE','m_lat':'DOUBLE'}";
-    // group members back into one row per cluster with a nested `detections` list.
-    let grouped = format!(
-        "SELECT cluster_id AS id, any_value(mgrs) AS mgrs, \
-           any_value(cluster_lon) AS lon, any_value(cluster_lat) AS lat, \
-           any_value(cluster_max_b12) AS max_b12, any_value(cluster_avg_b12) AS avg_b12, \
-           any_value(cluster_radiance) AS radiance, \
-           any_value(detection_count) AS detection_count, any_value(date_count) AS date_count, \
-           any_value(first_date) AS first_date, any_value(last_date) AS last_date, \
-           any_value(persistence) AS persistence, any_value(observations) AS observations, \
-           any_value(seasonal) AS seasonal, \
-           any_value(median_b12_b11_ratio) AS median_b12_b11_ratio, any_value(min_sun_elevation) AS min_sun_elevation, \
-           any_value(likely_glint) AS likely_glint, any_value(ratio_score) AS ratio_score, \
-           any_value(persistence_score) AS persistence_score, any_value(glint_penalty) AS glint_penalty, \
-           any_value(total_score) AS total_score, any_value(max_ratio) AS max_ratio, \
-           any_value(min_glint) AS min_glint, any_value(glint_suspect) AS glint_suspect, \
-           list(struct_pack(date := date, max_b12 := m_max_b12, peak_b11 := peak_b11, pixels := pixels, radiance := radiance, \
-             sun_elevation := sun_elevation, sun_azimuth := sun_azimuth, lon := m_lon, lat := m_lat) ORDER BY date) AS detections \
-         FROM read_csv('{m}', header=true, nullstr='', columns={cols}) GROUP BY cluster_id");
-    // the looks split by quarter, nested the same way — a second flat csv joined on
-    // the cluster id, so a reader windowing to some quarters sums the counts it is
-    // showing instead of prorating the total across them. null where the rescore
-    // measured nothing, exactly as `observations` is.
-    let grouped = format!(
-        "SELECT g.*, q.quarters FROM ({grouped}) g LEFT JOIN (\
-           SELECT cluster_id, list(struct_pack(quarter := quarter, observations := observations) \
-             ORDER BY quarter) AS quarters \
-           FROM read_csv('{q}', header=true, columns={{'cluster_id':'VARCHAR','quarter':'DATE','observations':'INTEGER'}}) \
-           GROUP BY cluster_id) q ON q.cluster_id = g.id"
+/// write the two flat parquet outputs: one row per cluster, and one row per
+/// detection naming the cluster it joined.
+pub fn write(clusters: &[Cluster], clusters_out: &str, members_out: &str) -> Result<(), String> {
+    let cf = tmp("clusters.csv");
+    let mf = tmp("members.csv");
+    std::fs::write(
+        &cf,
+        csv(&CLUSTER, clusters.iter().map(|c| cluster_row(c).join(","))),
+    )
+    .map_err(|e| format!("write clusters: {e}"))?;
+    std::fs::write(
+        &mf,
+        csv(
+            &MEMBER,
+            clusters
+                .iter()
+                .flat_map(|c| c.members.iter().map(|m| format!("{},{}", m.id, c.id))),
+        ),
+    )
+    .map_err(|e| format!("write members: {e}"))?;
+    // flags travels as a ;-joined scalar and lands as the archive's VARCHAR[] —
+    // an empty list, never null, for a site carrying no qualifier. the coalesce
+    // is what makes that true: nullstr reads the empty cell back as null, and a
+    // null there would read as "unknown" where we mean "none".
+    let sql = format!(
+        "{prelude}\
+         COPY (SELECT * REPLACE ([f FOR f IN str_split(coalesce(flags, ''), ';') IF f <> ''] AS flags) \
+           FROM read_csv('{c}', header=true, nullstr='', columns={ct})) \
+           TO '{clusters_out}' (FORMAT PARQUET, COMPRESSION ZSTD);\n\
+         COPY (SELECT * FROM read_csv('{m}', header=true, columns={mt})) \
+           TO '{members_out}' (FORMAT PARQUET, COMPRESSION ZSTD);",
+        prelude = s3_prelude(),
+        c = cf.to_string_lossy(),
+        ct = types(&CLUSTER),
+        m = mf.to_string_lossy(),
+        mt = types(&MEMBER),
     );
-    let prelude = s3_prelude();
-    // a plain `.parquet` → one file, mgrs in the body. a clusters/ dir or s3 prefix →
-    // one deterministic `mgrs=<tile>/data.parquet` PER TILE (mgrs in the path, not the
-    // body), mirroring detections/ exactly. we loop the tiles ourselves rather than
-    // PARTITION_BY because duckdb always indexes the partition filename (`data_0.parquet`
-    // — even FILENAME_PATTERN appends the index); a per-tile single-file COPY overwrites
-    // its own key idempotently and lands the clean `data.parquet` the readers expect.
-    let sql = if out.ends_with(".parquet") {
-        format!("{prelude}COPY ({grouped}) TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-    } else {
-        let tiles: std::collections::BTreeSet<&str> =
-            clusters.iter().map(|c| c.mgrs.as_str()).collect();
-        let base = out.trim_end_matches('/');
-        // a single-file COPY won't create the mgrs=…/ dir (PARTITION_BY did); s3 keys need
-        // no mkdir, a local path does.
-        if !base.starts_with("s3://") {
-            for t in &tiles {
-                let _ = std::fs::create_dir_all(format!("{base}/mgrs={t}"));
-            }
-        }
-        let copies: String = tiles.iter().map(|t| format!(
-            "COPY (SELECT * EXCLUDE(mgrs) FROM v WHERE mgrs='{t}') TO '{base}/mgrs={t}/data.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);"
-        )).collect();
-        format!("{prelude}CREATE TEMP TABLE v AS {grouped};\n{copies}")
-    };
     let r = duckdb(&sql);
-    let _ = std::fs::remove_file(&members);
-    let _ = std::fs::remove_file(&quarters);
+    let _ = std::fs::remove_file(&cf);
+    let _ = std::fs::remove_file(&mf);
     r
-}
-
-/// the cluster view as a geojson FeatureCollection string (rich: scalar props +
-/// the nested `detections` array). used for file export and stdout.
-pub fn geojson(clusters: &[Cluster]) -> String {
-    let features: Vec<serde_json::Value> = clusters
-        .iter()
-        .map(|c| {
-            let props = serde_json::to_value(c).unwrap_or(serde_json::Value::Null);
-            serde_json::json!({
-                "type": "Feature",
-                "geometry": { "type": "Point", "coordinates": [c.lon, c.lat] },
-                "properties": props,
-            })
-        })
-        .collect();
-    serde_json::to_string(&serde_json::json!({ "type": "FeatureCollection", "features": features }))
-        .unwrap_or_default()
-}
-
-fn write_geojson(clusters: &[Cluster], out: &str) -> Result<(), String> {
-    std::fs::write(out, geojson(clusters)).map_err(|e| format!("write geojson: {e}"))
 }

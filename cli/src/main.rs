@@ -18,10 +18,7 @@ mod verify;
 mod view;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use rayon::prelude::*;
-use s2e_core::{
-    cluster_detections, pad_bbox, Cluster, ClusterOptions, Detection, Site, Thresholds,
-};
+use s2e_core::{cluster_detections, pad_bbox, Cluster, ClusterOptions, Thresholds};
 use std::fs;
 use std::path::Path;
 
@@ -33,6 +30,10 @@ struct Cli {
     cmd: Cmd,
 }
 
+// `detect` carries the whole shared option block and the others no longer do,
+// so the variants are lopsided. one of these is parsed per process — boxing it
+// would buy an allocation and nothing else.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Detect emissions into independent, resumable GeoJSON analysis records.
@@ -57,16 +58,26 @@ enum Cmd {
         #[command(flatten)]
         c: Common,
     },
-    /// Derive the cluster view over the archive (--archive) or a fresh detect.
+    /// Cluster detections into persistent flare sites. Publishing is the ETL
+    /// repository's job: this writes the sites and their membership, and nothing
+    /// that counts days — only the table holding the observations can do that.
     Cluster {
-        /// Detection source: a duckdb-readable parquet/csv glob, e.g.
-        /// s3://bkt/detections/**/*.parquet (else --bbox/--aoi to detect fresh).
-        #[arg(long, value_name = "GLOB")]
-        archive: Option<String>,
-        /// Output FILE (.geojson journalist · .parquet/s3://… nested web-map view);
-        /// omit → geojson to stdout.
+        /// Detections parquet: id, lon, lat, date, max_b12, max_b11,
+        /// b12_b11_ratio, radiance, sun_elevation, glint_score.
         #[arg(long, value_name = "FILE")]
-        out: Option<String>,
+        detections: String,
+        /// One row per cluster: id, position, score, flags and the cluster-level
+        /// measures the clustering itself produced.
+        #[arg(long, value_name = "FILE")]
+        clusters: String,
+        /// One row per detection that joined a cluster: id, site_id.
+        #[arg(long, value_name = "FILE")]
+        members: String,
+        /// Cloud-mask parquet (lon, lat, date, cloud) for the persistence
+        /// denominator: spatial-join each cluster anchor's ~100 m cell →
+        /// n_clear_obs = distinct clear dates, which rescores the site.
+        #[arg(long, value_name = "FILE")]
+        clouds: Option<String>,
         /// Min distinct dates per cluster (recall-first floor: drop true singletons only;
         /// rank on the score's clear-sky persistence term, don't hard-gate the count).
         #[arg(long, default_value_t = 2)]
@@ -77,24 +88,12 @@ enum Cmd {
         /// Drop clusters scoring below this.
         #[arg(long, default_value_t = 0.0)]
         score_threshold: f64,
-        /// Cloud mask (clouds/ glob/parquet) for the persistence denominator: spatial-
-        /// join each cluster anchor's ~100 m cell → n_clear_obs = distinct clear dates,
-        /// rescoring the view. The fold-in default (one SCL read at detect, no 2nd pass).
-        #[arg(long, value_name = "GLOB")]
-        clouds: Option<String>,
-        /// (validation/fallback) Site-anchored clear-sky coverage SCAN into DIR (resumable
-        /// per-scene): re-read SCL at each anchor over every acquisition → persistence.
-        /// Superseded by --clouds; kept to cross-check the fold-in. Needs a scene source.
-        #[arg(long, value_name = "DIR")]
-        coverage_scan: Option<String>,
-        /// Aggregate an existing --coverage-scan DIR without re-enumerating scenes.
-        /// The rescore reads the scan directory, not the catalogue, so re-publishing
-        /// from a finished scan does not need the per-tile STAC search at all — it
-        /// would page for an hour only to skip every scene it found.
-        #[arg(long, requires = "coverage_scan")]
-        coverage_reuse: bool,
-        #[command(flatten)]
-        c: Common,
+        /// Window start (default ~6 months ago).
+        #[arg(long, value_name = "Y-M-D")]
+        start: Option<String>,
+        /// Window end (default today).
+        #[arg(long, value_name = "Y-M-D")]
+        end: Option<String>,
     },
     /// Fetch and verify the pinned upstream MARS-S2L + CloudSEN checkpoints.
     Models {
@@ -110,13 +109,13 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         destination: Option<String>,
     },
-    /// Deterministic plume triage: score data-desk/retrievals (wind consistency,
-    /// fixed-offset recurrence, scene-day regimes, magnitude prior, scene
-    /// hygiene, optional OSM collinearity) into a ranked candidate list for
-    /// valid-plume curation (etl/s2e/sql/valid-plumes.txt). Never mutates canonical
-    /// records; rebuild the views first so they carry target/sun/footprint.
+    /// Deterministic plume triage: score the published plume detections (wind
+    /// consistency, fixed-offset recurrence, scene-day regimes, magnitude prior,
+    /// scene hygiene, optional OSM collinearity) into a ranked candidate list for
+    /// valid-plume curation (etl/providers/data-desk/s2e/sql/valid-plumes.txt).
+    /// Never mutates canonical records; rebuild the tables first.
     Review {
-        /// Store ROOT containing data-desk/retrievals (local dir or s3:// prefix).
+        /// Store ROOT containing data-desk/detections (local dir or s3:// prefix).
         #[arg(long, value_name = "ROOT")]
         root: String,
         /// Linear features GeoJSON (OSM roads/boundaries/waterways/hedges) for
@@ -240,12 +239,17 @@ struct Knobs {
     hot_floor: f64,
 }
 
+/// the search window, defaulted: ~6 months back to today.
+fn window(start: &Option<String>, end: &Option<String>) -> (String, String) {
+    (
+        start.clone().unwrap_or_else(|| days_ago(183)),
+        end.clone().unwrap_or_else(today),
+    )
+}
+
 impl Common {
     fn dates(&self) -> (String, String) {
-        (
-            self.start.clone().unwrap_or_else(|| days_ago(183)),
-            self.end.clone().unwrap_or_else(today),
-        )
+        window(&self.start, &self.end)
     }
     fn thresholds(&self) -> Thresholds {
         let k = &self.knobs;
@@ -459,36 +463,38 @@ fn main() {
             }
         }
         Cmd::Cluster {
-            c,
-            archive,
-            out,
+            detections,
+            clusters: out,
+            members,
+            clouds,
             min_dates,
             min_avg_b12,
             score_threshold,
-            clouds,
-            coverage_scan,
-            coverage_reuse,
+            start,
+            end,
         } => {
-            if archive.is_none() && c.bbox.is_none() && c.aoi.is_none() && c.region.is_none() {
-                die("cluster: provide --archive GLOB, or --bbox/--aoi/--region to detect fresh");
-            }
-            let opts = ClusterOptions {
-                merge_distance: 135.0,
-                min_dates: *min_dates,
-                min_avg_b12: *min_avg_b12,
-                observations: None,
-                score_threshold: *score_threshold,
-            };
-            run_cluster(
-                c,
-                archive,
-                out,
-                opts,
-                clouds,
-                coverage_scan,
-                *coverage_reuse,
-                &pool(c.concurrency),
+            let (start, end) = window(start, end);
+            eprintln!("cluster: {detections} | {start} → {end}");
+            let dets = view::read_detections(detections, &start, &end).unwrap_or_else(|e| die(&e));
+            let mut clusters = cluster_detections(
+                &dets,
+                &ClusterOptions {
+                    merge_distance: 135.0,
+                    min_dates: *min_dates,
+                    min_avg_b12: *min_avg_b12,
+                    observations: None,
+                    score_threshold: *score_threshold,
+                },
             );
+            eprintln!("{} detections → {} clusters", dets.len(), clusters.len());
+            // clear-sky persistence: join each anchor's ~100 m cell against the
+            // cloud mask emitted during detection (one SCL read, no second pass)
+            // and rescore on the measured n_clear_obs denominator.
+            if let Some(path) = clouds {
+                clouds_rescore(path, &start, &end, &mut clusters);
+            }
+            view::write(&clusters, out, members).unwrap_or_else(|e| die(&e));
+            eprintln!("clusters → {out} · members → {members}");
         }
         Cmd::Models { dir } => {
             let dir = dir
@@ -568,110 +574,15 @@ fn aoi_fits_chip(aoi: &Aoi, chip: &plume::Chip, epsg: i32) -> bool {
             && y >= chip.max_y - chip.height as f64 * 10.0
     })
 }
-fn run_cluster(
-    c: &Common,
-    archive: &Option<String>,
-    out: &Option<String>,
-    mut opts: ClusterOptions,
-    clouds: &Option<String>,
-    coverage_scan: &Option<String>,
-    coverage_reuse: bool,
-    pool: &rayon::ThreadPool,
-) {
-    let (start, end) = c.dates();
-    let (detections, observations) = match archive {
-        Some(glob) => {
-            eprintln!("cluster: archive {glob} | {start} → {end}");
-            (
-                view::read_archive(glob, c.bbox, &start, &end).unwrap_or_else(|e| die(&e)),
-                None,
-            )
-        }
-        None => {
-            let t = c.thresholds();
-            let aois = load_aois(c);
-            let reader = read::make_reader(c.gpu, c.region.is_some()).unwrap_or_else(|e| die(&e));
-            eprintln!(
-                "cluster: fresh detect over {} aoi(s) | {start} → {end}",
-                aois.len()
-            );
-            let mut dets = Vec::new();
-            let mut obs: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-            for aoi in &aois {
-                let mut items = match stac::search(aoi.bbox, &start, &end, c.cloud, &c.source) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("  {} search FAIL: {e}", aoi.id);
-                        continue;
-                    }
-                };
-                filter_tiles(c, &mut items);
-                let res: Vec<(String, bool, Vec<Detection>)> = pool.install(|| {
-                    items
-                        .par_iter()
-                        .map(|item| {
-                            match read::detect_scene(
-                                &*reader,
-                                item,
-                                det_bbox(aoi, item),
-                                aoi.full_tile,
-                                &t,
-                                true,
-                            ) {
-                                Ok((d, cf)) => (item.date.clone(), cf, d),
-                                Err(e) => {
-                                    eprintln!("  {} {}_{} FAIL: {e}", aoi.id, item.mgrs, item.date);
-                                    (item.date.clone(), false, Vec::new())
-                                }
-                            }
-                        })
-                        .collect()
-                });
-                for (date, cf, d) in res {
-                    obs.insert(date, cf);
-                    dets.extend(d);
-                }
-                eprintln!("  {} {}: {} scenes", aoi.id, aoi.name, items.len());
-            }
-            (dets, Some(obs.values().filter(|v| **v).count()))
-        }
-    };
-
-    opts.observations = observations;
-    let mut clusters = cluster_detections(&detections, &opts);
-    eprintln!(
-        "{} detections → {} clusters",
-        detections.len(),
-        clusters.len()
-    );
-
-    // clear-sky persistence: the fold-in path joins each anchor's ~100 m cell against
-    // the cloud mask emitted during detection (one SCL read, no second pass); the
-    // legacy --coverage-scan re-reads SCL at every anchor (kept to cross-check). either
-    // rescores with the measured n_clear_obs denominator via the same score_cluster.
-    if let Some(glob) = clouds {
-        clouds_rescore(glob, &start, &end, &mut clusters);
-    } else if let (Some(dir), Some(arch)) = (coverage_scan, archive) {
-        coverage_rescore(c, arch, dir, &start, &end, &mut clusters, pool, coverage_reuse);
-    }
-
-    match out {
-        Some(path) => match view::write_view(&clusters, path) {
-            Ok(()) => eprintln!("view → {path}"),
-            Err(e) => die(&format!("write view: {e}")),
-        },
-        None => print!("{}", view::geojson(&clusters)),
-    }
-}
 
 // the fold-in rescore: spatial-join each cluster anchor against the cloud mask
-// (clouds/, emitted at detection). n_clear_obs = distinct dates where the anchor's
-// ~100 m cell was clear (cloud_frac ≤ CLEAR_MAX), ∪ the site's own detection dates
-// (a lit look is an observation; guarantees n_dates ⊆). a hash join on the snapped
-// cell key — same grid both sides; widen to the 3×3 neighbourhood when the exact cell
-// has no rows (a cell-edge anchor). a cell with no mask rows → observations left None
-// (persistence skipped, as when coverage is absent). no STAC search, no second SCL pass.
-fn clouds_rescore(glob: &str, start: &str, end: &str, clusters: &mut [Cluster]) {
+// emitted at detection. n_clear_obs = distinct dates where the anchor's ~100 m
+// cell was clear (cloud ≤ CLEAR_MAX), ∪ the site's own detection dates (a lit
+// look is an observation; guarantees n_dates ⊆). a hash join on the snapped cell
+// key — same grid both sides; widen to the 3×3 neighbourhood when the exact cell
+// has no rows (a cell-edge anchor). a cell with no mask rows is left unrescored,
+// keeping the persistence term at 0 rather than inventing a denominator.
+fn clouds_rescore(path: &str, start: &str, end: &str, clusters: &mut [Cluster]) {
     use std::collections::{HashMap, HashSet};
     let step = s2e_core::GRID_STEP;
     // the join only ever reads each anchor's own cell + its 3×3 fallback, so precompute
@@ -690,18 +601,18 @@ fn clouds_rescore(glob: &str, start: &str, end: &str, clusters: &mut [Cluster]) 
     }
     // cell key → the distinct dates that cell was observed CLEAR (relevant cells only).
     let mut clear: HashMap<String, HashSet<String>> = HashMap::new();
-    view::read_clouds(glob, start, end, &cells, |glon, glat, date, cf| {
+    view::read_clouds(path, start, end, &cells, |lon, lat, date, cf| {
         if cf <= s2e_core::CLEAR_MAX {
-            let k = s2e_core::cell_key(glon, glat);
+            let k = s2e_core::cell_key(lon, lat);
             if needed.contains(&k) {
                 clear.entry(k).or_default().insert(date.to_string());
             }
         }
     })
     .unwrap_or_else(|e| die(&e));
-    let (mut rescored, mut joined) = (0usize, 0usize);
+    let mut rescored = 0usize;
     for cl in clusters.iter_mut() {
-        let mut dates: HashSet<String> = cl.detections.iter().map(|d| d.date.clone()).collect();
+        let mut dates: HashSet<String> = cl.members.iter().map(|m| m.date.clone()).collect();
         // the anchor's own cell first; only if it carries no mask rows fall back to the
         // 3×3 neighbourhood (cell-edge anchor) — avoids inflating the denominator.
         let own = s2e_core::cell_key(cl.lon, cl.lat);
@@ -729,165 +640,12 @@ fn clouds_rescore(glob: &str, start: &str, end: &str, clusters: &mut [Cluster]) 
             any
         };
         if hit {
-            joined += 1;
-            cl.set_observation_dates(dates.iter().map(String::as_str));
+            cl.set_observations(dates.len());
             rescored += 1;
         }
     }
     eprintln!(
-        "clouds: joined {joined} / {} clusters against the cloud mask ({rescored} rescored)",
-        clusters.len()
-    );
-}
-
-// the coverage scan + rescore. resumable per-scene SCL sampling at the cluster
-// anchors (presence == done), then n_clear_obs per site → Cluster::set_observations.
-// clear == cloud fraction over the site window ≤ CLEAR_MAX (permian's clear-sky rule).
-fn coverage_rescore(
-    c: &Common,
-    glob: &str,
-    dir: &str,
-    start: &str,
-    end: &str,
-    clusters: &mut [Cluster],
-    pool: &rayon::ThreadPool,
-    reuse: bool,
-) {
-    const CLEAR_MAX: f64 = 0.10;
-    // a rate off a handful of looks is noise, not a rate — publish nothing instead.
-    const MIN_LOOKS: usize = 10;
-    let sites: Vec<Site> = clusters
-        .iter()
-        .map(|c| Site {
-            h3: c.id.clone(),
-            lon: c.lon,
-            lat: c.lat,
-        })
-        .collect();
-    if sites.is_empty() {
-        return;
-    }
-    // the aggregation below reads the scan DIRECTORY, not the catalogue, so a finished
-    // scan needs neither the search nor the reads: enumerating 139k scenes to skip every
-    // one of them cost an hour of stac paging and changed nothing. --coverage-reuse is
-    // the re-publish path. left off by default so a partial scan still resumes per scene.
-    if reuse {
-        let scanned = fs::read_dir(dir)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_name().to_string_lossy().ends_with(".csv"))
-                    .count()
-            })
-            .unwrap_or(0);
-        if scanned == 0 {
-            die(&format!("--coverage-reuse: no scanned scenes in {dir}/"));
-        }
-        eprintln!("coverage: reusing {scanned} scanned scenes in {dir}/ (no stac search)");
-    } else {
-    // per-tile STAC search → the unique acquisitions that can see any anchor (the
-    // clear-but-unlit looks the detection archive can't supply — its own denominator).
-    let tiles = view::tile_bboxes(glob, start, end).unwrap_or_else(|e| die(&e));
-    let mut scenes: std::collections::HashMap<String, stac::Item> =
-        std::collections::HashMap::new();
-    for (mgrs, bb) in &tiles {
-        match stac::search(*bb, start, end, 100.0, &c.source) {
-            Ok(items) => {
-                for it in items {
-                    scenes.entry(it.id.clone()).or_insert(it);
-                }
-            }
-            Err(e) => eprintln!("  coverage search {mgrs} FAIL: {e}"),
-        }
-    }
-    let items: Vec<stac::Item> = scenes.into_values().collect();
-    let _ = fs::create_dir_all(dir);
-    eprintln!(
-        "coverage: {} sites · {} scenes → {dir}/",
-        sites.len(),
-        items.len()
-    );
-    // resumable per-scene scan: <mgrs>_<date>.csv = id,cloud_frac per in-footprint site.
-    pool.install(|| {
-        items.par_iter().for_each(|it| {
-            let path = format!("{dir}/{}_{}.csv", it.mgrs, it.date);
-            if Path::new(&path).exists() {
-                return;
-            }
-            let rows = read::cover_scene(it, &sites);
-            let body: String = std::iter::once("id,cloud_frac".to_string())
-                .chain(rows.iter().map(|(id, cf)| format!("{id},{cf}")))
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n";
-            let _ = fs::write(&path, body);
-        })
-    });
-    }
-
-    // the scan dir is windowless and resumable: it holds every scene ever scanned
-    // (2015→now), while the detections it is divided into cover whatever window was
-    // actually run — one year, for most tiles. counting all of it divides this year's
-    // detections by a decade of clear looks, which is how a flare lit on 54 of its 60
-    // clear looks published 18%. so a clear look only counts where the detector ran,
-    // and the evidence of a run is a detection somewhere in that tile that date: the
-    // scan file's own <mgrs>_<date> stem. tile-dates that produced nothing at all are
-    // lost with it, but those are overwhelmingly the ones too clouded to process.
-    let ran: std::collections::HashSet<String> = clusters
-        .iter()
-        .flat_map(|c| {
-            c.detections
-                .iter()
-                .map(move |d| format!("{}_{}", c.mgrs, d.date))
-        })
-        .collect();
-    // aggregate clear DATES per site id across the per-scene csvs (date is in the name).
-    let mut clear: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
-    if let Ok(rd) = fs::read_dir(dir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().to_string();
-            let Some(stem) = name.strip_suffix(".csv").filter(|s| ran.contains(*s)) else {
-                continue;
-            };
-            let date = match stem.rsplit_once('_') {
-                Some((_, d)) => d.to_string(),
-                None => continue,
-            };
-            let text = match fs::read_to_string(ent.path()) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            for line in text.lines().skip(1) {
-                if let Some((id, cf)) = line.split_once(',') {
-                    if cf.parse::<f64>().map(|v| v <= CLEAR_MAX).unwrap_or(false) {
-                        clear
-                            .entry(id.to_string())
-                            .or_default()
-                            .insert(date.clone());
-                    }
-                }
-            }
-        }
-    }
-    // n_clear_obs = |clear looks ∪ the site's own detection dates| (guarantees n_dates ⊆).
-    // only for sites the scan actually covered: with no clear looks the union is just
-    // the site's own lit dates, so set_observations would divide date_count by itself
-    // and publish a confident persistence of 1.0 for a site we never measured. leave
-    // those null, exactly as the fold-in join does when a cell has no mask rows.
-    let mut rescored = 0usize;
-    for cl in clusters.iter_mut() {
-        let Some(cd) = clear.get(&cl.id) else { continue };
-        let mut dates: std::collections::HashSet<String> =
-            cl.detections.iter().map(|d| d.date.clone()).collect();
-        dates.extend(cd.iter().cloned());
-        if dates.len() < MIN_LOOKS {
-            continue;
-        }
-        cl.set_observation_dates(dates.iter().map(String::as_str));
-        rescored += 1;
-    }
-    eprintln!(
-        "coverage: rescored {rescored} / {} clusters with clear-sky persistence",
+        "clouds: rescored {rescored} / {} clusters against the cloud mask",
         clusters.len()
     );
 }

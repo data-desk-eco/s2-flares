@@ -135,6 +135,9 @@ impl Default for BlockMeta {
     serde(default)
 )]
 pub struct Detection {
+    /// the caller's own key for this row, empty on a fresh detect — carried
+    /// through clustering so the membership can name the row it came from.
+    pub id: String,
     pub lon: f64,
     pub lat: f64,
     pub date: String,
@@ -561,6 +564,7 @@ pub fn detect_block(
             glint_score,
             peak_img_row: (y0 + peak_row) as i64,
             peak_img_col: (x0 + peak_col) as i64,
+            ..Default::default()
         });
     }
     (detections, block_cloud_free)

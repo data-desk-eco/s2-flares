@@ -47,9 +47,11 @@ target/release/s2e detect --mode flares --region 51.4,25.8,51.7,26.1
 # job (`etl/providers/data-desk/s2e/views`), so there is no `views` subcommand here.
 target/release/s2e archive --input out/uk --destination s3://bucket
 
-# Derive a flare-site view for another date window.
+# Cluster the parsed detections into persistent flare sites, and say which
+# detection joined which site. ETL reads both back and publishes the tables.
 target/release/s2e cluster \
-  --archive 's3://bucket/detections/**/*.parquet' --out clusters.parquet
+  --detections staging/flares.parquet --clouds staging/clouds.parquet \
+  --clusters staging/clusters.parquet --members staging/members.parquet
 ```
 
 Sources are `aws-l1c` (default), `cdse-l1c`, `aws` and `cdse`. Fixed `--wind-u`
@@ -85,12 +87,12 @@ idempotently commits the same path. Combined runs share computation in memory bu
 retain this clean persistence boundary.
 
 `archive` copies GeoJSON and raster assets unchanged. The records stop there: the
-DuckDB transforms that rebuild `data-desk/detections/`, private
-`ops/data-desk/clouds/`, and `data-desk/retrievals/` live in the ETL repository
-(`etl/providers/data-desk/s2e/sql`), because they are a
+DuckDB transforms that parse them into staging Parquet and publish
+`data-desk/detections/`, `data-desk/observations/` and `data-desk/flares/` live
+in the ETL repository (`etl/providers/data-desk/s2e/sql`), because they are a
 property of how the archive is published rather than of how detection works.
-`clusters/` is derived by `cluster`; none of the Parquet products is another
-authoritative detection format.
+`cluster` runs between the two stages and publishes nothing itself. None of the
+Parquet products is another authoritative detection format.
 
 ## Validation
 

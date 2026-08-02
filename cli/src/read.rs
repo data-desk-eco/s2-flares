@@ -12,7 +12,7 @@ use crate::stac::Item;
 use gdal::raster::ResampleAlg;
 use gdal::Dataset;
 use s2e_core::{
-    cover_sites, detect_block, enumerate_blocks, grid_sites, Block, BlockMeta, Detection, Site,
+    cover_sites, detect_block, enumerate_blocks, grid_sites, Block, BlockMeta, Detection,
     Thresholds, BLOCK_OVERLAP, BLOCK_SIZE,
 };
 
@@ -662,33 +662,6 @@ pub fn make_reader(gpu: bool, bulk: bool) -> Result<Box<dyn SceneReader>, String
     } else {
         Box::new(GdalReader)
     })
-}
-
-/// sample the SCL band at each site for one scene → (site_id, cloud_frac) for the
-/// in-footprint sites only. the I/O half of the site-anchored clear-sky denominator;
-/// the windowing/classification is `core::cover_sites`. SCL carries no harmonisation
-/// offset (it's a class band), so no per-date shift. one whole-band SCL read per scene
-/// (a single 20 m band) — cheap in-region, the second pass `cover_sites` was built for.
-pub fn cover_scene(item: &Item, sites: &[Site]) -> Vec<(String, f64)> {
-    let url = match &item.bands.scl {
-        Some(u) => u,
-        None => return Vec::new(),
-    };
-    let r = match open(url) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let scl = match whole::<u8>(&r) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    cover_sites(&scl, r.width, r.height, r.bbox, item.epsg, sites)
-        .into_iter()
-        .map(|c| {
-            let f = c.cloud_frac();
-            (c.h3, f)
-        })
-        .collect()
 }
 
 /// the cloud-mask slice for one scene (the persistence fold-in): one whole-band SCL

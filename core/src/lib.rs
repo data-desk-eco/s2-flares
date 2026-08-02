@@ -15,7 +15,7 @@ pub mod review;
 pub mod score;
 
 // public surface mirroring lib/index.js.
-pub use cluster::{cluster_detections, Cluster, ClusterOptions, DedupedDet, QuarterObs};
+pub use cluster::{cluster_detections, Cluster, ClusterOptions, Member};
 pub use coverage::{cell_key, cover_sites, grid_sites, snap, CoverRow, Site, CLEAR_MAX, GRID_STEP};
 pub use detect::{
     calibrate_dn, detect_block, dn_to_reflectance, enumerate_blocks, label_connected_components,

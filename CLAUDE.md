@@ -11,22 +11,22 @@ the machines belong to `data-desk`, the schedules to `etl`.
 core/                       pure compute; no I/O
   detect.rs                   flare methodology
   plume.rs                    registration, model tensors, components, retrieval
-  cluster.rs score.rs         persistent-site view and scoring
+  cluster.rs score.rs         persistent-site clustering and scoring
   review.rs                   plume-candidate triage verdicts
   coverage.rs geo.rs          cloud grid and geometry
 
 cli/                        native application
   detect.rs                   shared scene execution + independent record commits
   record.rs                   canonical GeoJSON identity and atomic writes
-  archive.rs                  publish unchanged records + derive Parquet views
+  archive.rs                  publish unchanged records and coverage
   plume.rs                    MARS orchestration, quantification and result writing
   plume/chip.rs               L1C/CloudSEN chip preparation and spatial footprints
   plume/background.rs         temporal background selection and ranking
   plume/wind.rs               GEOS-FP download/cache/sample
   models.rs                   Candle-native checkpoint definitions
   read.rs stac.rs             GDAL and catalogue I/O
-  view.rs                     DuckDB-backed derived view I/O
-  review.rs                   retrievals-view triage → ranked curation list
+  view.rs                     DuckDB-backed clustering I/O
+  review.rs                   plume-detection triage → ranked curation list
   main.rs                     CLI and cluster orchestration
 
   verify.rs                   run completeness: every feature scanned, no errors left
@@ -67,10 +67,10 @@ when computed together, so partial runs never mutate another detector's result.
 Retrying the same method replaces the same deterministic path; a method change
 creates a new record.
 
-GeoJSON records and assets are authoritative. The ETL job creates disposable
-Parquet indexes at `data-desk/detections/`, private `ops/data-desk/clouds/`, and
-`data-desk/retrievals/`; `cluster` creates `data-desk/clusters/`. They may be
-rebuilt from the private raw observations.
+GeoJSON records and assets are authoritative. The ETL job parses them into
+staging Parquet, calls `cluster`, and publishes `data-desk/detections/`,
+`data-desk/observations/` and `data-desk/flares/` from both. Every one of those
+is disposable and may be rebuilt from the private raw observations.
 
 ## Methodology invariants
 
@@ -91,9 +91,14 @@ rebuilt from the private raw observations.
 - `cluster_detections` and scoring remain pure shared-core functions. Persistence
   uses distinct clear dates from the cloud grid and is a score term, not a hard
   count gate.
-- Plume triage (`triage`) is a pure-core precision layer over the disposable
-  retrievals view, never the canonical records. Max probability is a floor only,
-  never a ranking weight, and curation into `data/valid-plumes.txt` stays human.
+- `cluster` scores and names sites; it does not count days. The counts and the
+  looks behind them are calculated where both tables are held, because that is
+  the only place a numerator and a denominator can be made to cover the same
+  window.
+- Plume triage (`triage`) is a pure-core precision layer over the published plume
+  detections, never the canonical records. Max probability is a floor only, never
+  a ranking weight, and curation into
+  `etl/providers/data-desk/s2e/sql/valid-plumes.txt` stays human.
 
 ## Execution
 
@@ -108,13 +113,13 @@ match. Errors remain retryable `.err` files and successful commits remove them.
 Positive probability rasters are committed before their referencing GeoJSON.
 
 Every operation over the record layout is a subcommand, never a script elsewhere.
-`archive` publishes canonical records, `views` rebuilds the disposable Parquet
-indexes, `cluster` builds the cluster snapshot, `verify` proves a run is complete
-and `coverage` maintains the published coverage overlay. `review` scores the
-retrievals view (wind consistency, fixed-offset recurrence, scene-day regimes,
+`archive` publishes canonical records, `cluster` groups the parsed detections into
+sites and their membership, `verify` proves a run is complete and `coverage`
+maintains the published coverage overlay. `review` scores the published plume
+detections (wind consistency, fixed-offset recurrence, scene-day regimes,
 cross-orbit backgrounds, magnitude prior, scene hygiene, optional OSM-line
 collinearity against the probability assets) into a ranked candidate CSV for
-`data/valid-plumes.txt` curation.
+valid-plume curation.
 
 ## What is not here
 

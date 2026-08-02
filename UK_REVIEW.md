@@ -48,9 +48,10 @@ downwind, non-repeating, plausible magnitude. the discriminators are real.
 
 ## Deterministic review layer
 
-A scored verdict pass over `data-desk/retrievals` that never mutates
-canonical records; output is a ranked candidate list for `data/valid-plumes.txt`
-curation. checks, strongest first:
+A scored verdict pass over the published plume detections
+(`data-desk/detections`, kind `plume`) that never mutates canonical records;
+output is a ranked candidate list for valid-plumes.txt curation. checks,
+strongest first:
 
 - linear-feature collinearity: buffer osm roads/boundaries/waterways/hedges by
   ~1 px; score fraction of mask pixels inside + alignment of the mask's
@@ -64,8 +65,9 @@ curation. checks, strongest first:
 - same-day multi-site veto: ≥2 targets positive on one acquisition day →
   scene-regime flag on all of them.
 - magnitude prior: flux > ~20 t/h uncorroborated → flag; flux ≈ 0 → reject.
-- scene hygiene: sun-elevation floor (winter), swath-edge flag, clear-percent
-  floor, cloud residue.
+- scene hygiene: sun-elevation floor (winter), clear-percent floor, cloud
+  residue. the swath-edge flag went with the scene footprint, which the
+  detections table no longer carries.
 - max probability is a floor only (reject < ~0.6), never a ranking weight:
   artefacts scored 0.91–0.99 while the credible-looking vents scored ~0.7.
 - optional upgrade: dual-geometry confirmation for persistent-source claims —

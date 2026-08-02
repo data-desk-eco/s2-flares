@@ -55,66 +55,31 @@ fn is_seasonal<'a>(dates: impl Iterator<Item = &'a str>) -> bool {
     true
 }
 
-/// one deduped per-date detection carried on a cluster.
+/// one detection that joined a cluster: the id it arrived with, and its date.
+/// the id is what the membership output hands back so the caller can label the
+/// archive row; the date is the numerator the cloud mask is measured against.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DedupedDet {
+pub struct Member {
+    pub id: String,
     pub date: String,
-    pub max_b12: f64,
-    pub peak_b11: Option<f64>,
-    pub pixels: u32,
-    pub radiance: f64,
-    pub sun_elevation: Option<f64>,
-    pub sun_azimuth: Option<f64>,
-    pub lon: f64,
-    pub lat: f64,
 }
 
-// "YYYY-MM-DD" → the first day of its calendar quarter.
-fn quarter_start(date: &str) -> Option<String> {
-    let m: u32 = date.get(5..7)?.parse().ok()?;
-    if !(1..=12).contains(&m) {
-        return None;
-    }
-    Some(format!("{}-{:02}-01", date.get(..4)?, (m - 1) / 3 * 3 + 1))
-}
-
-/// the looks measured in one calendar quarter — the persistence denominator,
-/// split so a reader can divide over the window it is showing rather than
-/// prorating the total across it.
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct QuarterObs {
-    /// First day of the quarter, matching data-desk/vnf/quarters.parquet.
-    pub quarter: String,
-    pub observations: u32,
-}
-
-/// a persistent flare site.
+/// a persistent flare site. everything countable — first and last seen, the
+/// detection and day counts, the looks behind them — is left to the caller, who
+/// holds both the detections and the observations and can count them over the
+/// same window. what is here is what only the clustering knows.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cluster {
     pub id: String,
-    /// anchor detection's mgrs tile — the view's partition key (clusters/mgrs=…/),
-    /// mirroring the detection archive. a cluster lives in one tile (its anchor's).
-    pub mgrs: String,
     pub lon: f64,
     pub lat: f64,
     pub max_b12: f64,
     pub avg_b12: f64,
-    /// median per-date hot-core radiance — a representative flare-volume proxy for
-    /// the site (the full per-date series is on `detections`).
+    /// median per-date hot-core radiance — a representative flare-volume proxy.
     pub radiance: f64,
-    pub detection_count: u32,
     pub date_count: u32,
-    pub first_date: String,
-    pub last_date: String,
-    pub persistence: Option<f64>,
-    /// the persistence denominator itself: clear-sky looks at the site over the
-    /// window the detector ran. published, not left to be divided back out.
-    pub observations: Option<u32>,
-    /// `observations` by calendar quarter; empty where none were measured.
-    pub quarters: Vec<QuarterObs>,
     pub seasonal: bool,
     pub median_b12_b11_ratio: Option<f64>,
     pub min_sun_elevation: Option<f64>,
@@ -126,48 +91,38 @@ pub struct Cluster {
     pub max_ratio: Option<f64>,
     pub min_glint: Option<f64>,
     pub glint_suspect: bool,
-    pub detections: Vec<DedupedDet>,
+    /// every detection that joined, same-date duplicates included: the score
+    /// dedupes those away, but each one is still a real row at this site.
+    pub members: Vec<Member>,
 }
 
 impl Cluster {
-    /// re-attach measured clear-sky persistence and rescore. `n_clear_obs` is the
-    /// number of cloud-free looks at the site (the honest denominator behind
-    /// persistence = n_dates / n_clear_obs); clamped ≥ date_count so persistence ∈
-    /// (0,1]. single-sources the score formula (score_cluster) so the archive path
-    /// matches the fresh-detect path — no second scoring implementation to drift.
-    /// the same measurement as `set_observations`, from the dates themselves, so
-    /// the per-quarter split comes with the total instead of being inferred later.
-    pub fn set_observation_dates<'a>(&mut self, dates: impl IntoIterator<Item = &'a str>) {
-        let mut by_q: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-        let mut n = 0usize;
-        for d in dates {
-            n += 1;
-            if let Some(q) = quarter_start(d) {
-                *by_q.entry(q).or_default() += 1;
-            }
+    /// the site's qualifiers as archive flag slugs, in a fixed order. empty
+    /// where the site has none — the absence of a qualifier, not the absence of
+    /// an opinion.
+    pub fn flags(&self) -> Vec<&'static str> {
+        let mut f = Vec::new();
+        if self.seasonal {
+            f.push("seasonal");
         }
-        self.quarters = by_q
-            .into_iter()
-            .map(|(quarter, observations)| QuarterObs {
-                quarter,
-                observations,
-            })
-            .collect();
-        self.set_observations(n);
+        if self.likely_glint == Some(true) {
+            f.push("likely_glint");
+        }
+        if self.glint_suspect {
+            f.push("glint_suspect");
+        }
+        f
     }
 
+    /// re-attach the measured clear-sky denominator and rescore. `n_clear_obs` is
+    /// the number of cloud-free looks at the site, clamped ≥ date_count so a site
+    /// cannot be lit on more days than it was looked at. single-sources the score
+    /// formula (score_cluster), so a rescore cannot drift from the first scoring.
     pub fn set_observations(&mut self, n_clear_obs: usize) {
-        let n = n_clear_obs.max(self.date_count as usize);
-        self.observations = if n > 0 { Some(n as u32) } else { None };
-        self.persistence = if n > 0 {
-            Some(self.date_count as f64 / n as f64)
-        } else {
-            None
-        };
         let sc = score_cluster(
             self.max_ratio,
             self.date_count as f64,
-            n as f64,
+            n_clear_obs.max(self.date_count as usize) as f64,
             self.min_glint,
         );
         self.ratio_score = sc.ratio_score;
@@ -182,8 +137,8 @@ pub struct ClusterOptions {
     pub merge_distance: f64,
     pub min_dates: usize,
     pub min_avg_b12: f64,
-    /// cloud-free observation count (the persistence denominator). None = no
-    /// observations supplied → persistence field left null, persistence_score 0.
+    /// cloud-free observation count (the persistence denominator). None = none
+    /// supplied → nothing to divide by, so persistence_score stays 0.
     pub observations: Option<usize>,
     pub score_threshold: f64,
 }
@@ -251,7 +206,7 @@ fn score_of(deduped: &[&Detection], peak_b12: f64, cloud_free_count: usize) -> S
 }
 
 // median b12/b11 ratio, min sun elevation, likely_glint over a cluster's dets.
-fn glint_metrics(dets: &[DedupedDet]) -> (Option<f64>, Option<f64>, Option<bool>) {
+fn glint_metrics(dets: &[&Detection]) -> (Option<f64>, Option<f64>, Option<bool>) {
     let mut ratios: Vec<f64> = Vec::new();
     let mut min_sun = f64::INFINITY;
     let mut have_sun = false;
@@ -284,17 +239,10 @@ fn glint_metrics(dets: &[DedupedDet]) -> (Option<f64>, Option<f64>, Option<bool>
     (median, min_sun_elevation, likely_glint)
 }
 
-fn deduped_out(d: &Detection) -> DedupedDet {
-    DedupedDet {
+fn member_of(d: &Detection) -> Member {
+    Member {
+        id: d.id.clone(),
         date: d.date.clone(),
-        max_b12: d.max_b12,
-        peak_b11: d.peak_b11,
-        pixels: d.pixels,
-        radiance: d.radiance,
-        sun_elevation: d.sun_elevation,
-        sun_azimuth: d.sun_azimuth,
-        lon: d.lon,
-        lat: d.lat,
     }
 }
 
@@ -319,7 +267,6 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
         return Vec::new();
     }
     let cloud_free_count = opts.observations.unwrap_or(0);
-    let has_obs = opts.observations.is_some();
 
     // per-detection clusters (merge off).
     if opts.merge_distance == 0.0 {
@@ -328,32 +275,19 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
             if det.max_b12 < opts.min_avg_b12 {
                 continue;
             }
-            let out = deduped_out(det);
             let sc = score_of(&[det], det.max_b12, cloud_free_count);
             if opts.score_threshold > 0.0 && sc.total_score < opts.score_threshold {
                 continue;
             }
-            let dets = vec![out];
-            let (median, min_sun, likely) = glint_metrics(&dets);
+            let (median, min_sun, likely) = glint_metrics(&[det]);
             clusters.push(Cluster {
                 id: cluster_hash(det.lat, det.lon),
-                mgrs: det.mgrs.clone(),
                 lon: det.lon,
                 lat: det.lat,
                 max_b12: det.max_b12,
                 avg_b12: det.max_b12,
                 radiance: det.radiance,
-                detection_count: 1,
                 date_count: 1,
-                first_date: det.date.clone(),
-                last_date: det.date.clone(),
-                persistence: if cloud_free_count > 0 {
-                    Some(1.0 / cloud_free_count as f64)
-                } else {
-                    None
-                },
-                observations: (cloud_free_count > 0).then_some(cloud_free_count as u32),
-                quarters: Vec::new(),
                 seasonal: is_seasonal(std::iter::once(det.date.as_str())),
                 median_b12_b11_ratio: median,
                 min_sun_elevation: min_sun,
@@ -365,7 +299,7 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
                 max_ratio: sc.max_ratio,
                 min_glint: sc.min_glint,
                 glint_suspect: sc.glint_suspect,
-                detections: dets,
+                members: vec![member_of(det)],
             });
         }
         return clusters;
@@ -448,45 +382,23 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
             }
         }
 
-        let mut dates: Vec<&str> = deduped.iter().map(|d| d.date.as_str()).collect();
-        dates.sort_unstable();
-        let first_date = dates[0].to_string();
-        let last_date = dates[dates.len() - 1].to_string();
         let seasonal = is_seasonal(deduped.iter().map(|d| d.date.as_str()));
-
-        let persistence = if has_obs {
-            if cloud_free_count > 0 {
-                Some(deduped.len() as f64 / cloud_free_count as f64)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         let sc = score_of(&deduped, anchor.max_b12, cloud_free_count);
         if opts.score_threshold > 0.0 && sc.total_score < opts.score_threshold {
             continue;
         }
 
-        let dets: Vec<DedupedDet> = deduped.iter().map(|d| deduped_out(d)).collect();
-        let (median, min_sun, likely) = glint_metrics(&dets);
+        let (median, min_sun, likely) = glint_metrics(&deduped);
 
         result.push(Cluster {
             id: cluster_hash(anchor.lat, anchor.lon),
-            mgrs: anchor.mgrs.clone(),
             lon: anchor.lon,
             lat: anchor.lat,
             max_b12: anchor.max_b12,
             avg_b12,
             radiance,
-            detection_count: deduped.len() as u32,
             date_count: deduped.len() as u32,
-            first_date,
-            last_date,
-            persistence,
-            observations: (has_obs && cloud_free_count > 0).then_some(cloud_free_count as u32),
-            quarters: Vec::new(),
             seasonal,
             median_b12_b11_ratio: median,
             min_sun_elevation: min_sun,
@@ -498,7 +410,7 @@ pub fn cluster_detections(detections: &[Detection], opts: &ClusterOptions) -> Ve
             max_ratio: sc.max_ratio,
             min_glint: sc.min_glint,
             glint_suspect: sc.glint_suspect,
-            detections: dets,
+            members: members.iter().map(|&si| member_of(sorted[si])).collect(),
         });
     }
     result
@@ -539,10 +451,10 @@ mod tests {
             }
         }
         let c = &cluster_detections(&dets, &opts())[0];
-        assert_eq!(c.detections[0].peak_b11, Some(1.40));
         assert!((c.median_b12_b11_ratio.unwrap() - 1.41 / 1.40).abs() < 1e-6);
         assert_eq!(c.min_sun_elevation, Some(65.0));
         assert_eq!(c.likely_glint, Some(true));
+        assert!(c.flags().contains(&"likely_glint"));
     }
 
     // glint.test.mjs [2] — real flare thermal ratio
@@ -635,48 +547,44 @@ mod tests {
                 dets.push(x);
             }
         }
-        // no observations supplied → persistence null, persistence_score 0.
+        // no observations supplied → nothing to divide by, persistence_score 0.
         let mut c = cluster_detections(&dets, &opts())[0].clone();
-        assert_eq!(c.persistence, None);
         assert_eq!(c.persistence_score, 0.0);
-        // 12 dates over 24 clear looks → persistence 0.5; matches score_cluster directly.
+        // 12 dates over 24 clear looks; matches score_cluster directly.
         c.set_observations(24);
-        assert!((c.persistence.unwrap() - 0.5).abs() < 1e-9);
         let want = crate::score::score_cluster(c.max_ratio, c.date_count as f64, 24.0, c.min_glint);
         assert!((c.persistence_score - want.persistence_score).abs() < 1e-9);
         assert!((c.total_score - want.total_score).abs() < 1e-9);
-        // n_clear_obs clamped ≥ date_count → persistence ≤ 1.
+        // fewer looks than lit days is not a rate: the denominator clamps up.
         c.set_observations(1);
-        assert!((c.persistence.unwrap() - 1.0).abs() < 1e-9);
+        let want = crate::score::score_cluster(c.max_ratio, c.date_count as f64, 12.0, c.min_glint);
+        assert!((c.total_score - want.total_score).abs() < 1e-9);
     }
 
-    // the looks split by quarter: same total as set_observations, keyed on the first
-    // day of each calendar quarter, so a reader can divide over the window it shows.
+    // every detection that joined comes back out, same-date duplicates included:
+    // each is an archive row the caller has to label with this site.
     #[test]
-    fn observation_dates_split_by_quarter() {
-        let mut c = Cluster {
-            date_count: 2,
-            ..Default::default()
-        };
-        c.set_observation_dates(
-            ["2025-01-02", "2025-03-31", "2025-04-01", "2025-12-30"]
-                .into_iter(),
-        );
-        assert_eq!(c.observations, Some(4));
-        let q: Vec<(&str, u32)> = c
-            .quarters
+    fn members_carry_every_joined_id() {
+        let dets: Vec<Detection> = ["2024-05-01", "2024-05-01", "2024-06-11", "2024-07-21"]
             .iter()
-            .map(|q| (q.quarter.as_str(), q.observations))
+            .enumerate()
+            .map(|(i, d)| Detection {
+                id: format!("d{i}"),
+                ..det(d, 1.0, 0.4, 65.0)
+            })
             .collect();
-        assert_eq!(
-            q,
-            vec![("2025-01-01", 2), ("2025-04-01", 1), ("2025-10-01", 1)]
-        );
-        // the quarters account for every look the total counts.
-        assert_eq!(
-            c.quarters.iter().map(|q| q.observations).sum::<u32>(),
-            c.observations.unwrap()
-        );
+        let c = &cluster_detections(
+            &dets,
+            &ClusterOptions {
+                min_dates: 3,
+                min_avg_b12: 0.5,
+                ..Default::default()
+            },
+        )[0];
+        let mut ids: Vec<&str> = c.members.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["d0", "d1", "d2", "d3"]);
+        assert_eq!(c.date_count, 3); // …while the score still counts distinct days
     }
 
     // score.test.mjs [8] — scoreThreshold drops low-quality clusters

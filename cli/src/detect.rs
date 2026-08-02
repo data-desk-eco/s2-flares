@@ -109,6 +109,7 @@ fn flare_features(detections: &[Detection]) -> Vec<Value> {
                 // positional/bookkeeping fields plus scene-level constants: the
                 // latter live once on the analysis, not on every feature.
                 for key in [
+                    "id",
                     "lon",
                     "lat",
                     "peak_img_row",

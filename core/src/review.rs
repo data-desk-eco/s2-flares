@@ -1,7 +1,7 @@
 //! deterministic plume-candidate triage — the review layer recovered from the
 //! human-reviewed uk-gas-onshore runs (UK_REVIEW.md). pure compute over scalars
-//! flattened from the disposable retrievals view: canonical records are never
-//! mutated; the output ranks candidates for data/valid-plumes.txt curation.
+//! flattened from the published plume detections: canonical records are never
+//! mutated; the output ranks candidates for valid-plumes.txt curation.
 //! this restores precision, not recall — it is triage for mars-s2l, not a fix.
 //! max probability is a floor only, never a ranking weight (uk artefacts scored
 //! 0.91–0.99 while the credible vents sat near 0.7).
@@ -20,7 +20,7 @@ pub const CLEAR_FLOOR_PCT: f64 = 40.0; // cloud-residue floor
 pub const COLLINEAR_REJECT: f64 = 0.5; // boundary-following mask
 pub const COLLINEAR_FLAG: f64 = 0.25;
 
-/// one detected plume feature, flattened from the retrievals view.
+/// one detected plume feature, flattened from the detections table.
 #[derive(Clone, Debug, Default)]
 pub struct PlumeCandidate {
     /// `target:date:plume-id` — the valid-plumes.txt curation key.
@@ -39,7 +39,6 @@ pub struct PlumeCandidate {
     pub flux_kg_h: f64,
     pub clear_percent: f64,
     pub sun_elevation: Option<f64>,
-    pub swath_edge: bool,
     /// background scene from a different relative orbit than the scene: the
     /// pairing views the surface from another angle, and spectrally uneven
     /// brdf injects ±2% mbmp fields — plume-sized artefacts (barrow null test:
@@ -162,9 +161,6 @@ pub fn triage(c: &[PlumeCandidate]) -> Vec<Verdict> {
             if x.clear_percent < CLEAR_FLOOR_PCT {
                 flagged.push(("cloud-residue", 0.1));
             }
-            if x.swath_edge {
-                flagged.push(("swath-edge", 0.1));
-            }
             if x.cross_orbit_bg {
                 flagged.push(("cross-orbit-bg", 0.25));
             }
@@ -211,7 +207,6 @@ mod tests {
             flux_kg_h: 4700.0,
             clear_percent: 100.0,
             sun_elevation: Some(35.0),
-            swath_edge: false,
             cross_orbit_bg: false,
             collinearity: Some(0.05),
         }
@@ -302,10 +297,9 @@ mod tests {
         let mut winter = clean("w:d:p", "2026-01-02");
         winter.sun_elevation = Some(12.0);
         winter.clear_percent = 30.0;
-        winter.swath_edge = true;
         let v = triage(&[road, winter]);
-        assert_eq!(v[0].flags, ["low-sun", "cloud-residue", "swath-edge"]);
-        assert!((v[0].score - 0.65).abs() < 1e-9);
+        assert_eq!(v[0].flags, ["low-sun", "cloud-residue"]);
+        assert!((v[0].score - 0.75).abs() < 1e-9);
         assert_eq!(v[1].rejects, ["collinear"]);
         assert_eq!(v[1].score, 0.0);
     }

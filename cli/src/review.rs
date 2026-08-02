@@ -1,32 +1,37 @@
-//! deterministic triage over the disposable retrievals view (UK_REVIEW.md's
-//! review layer): duckdb flattens detected plume rows to scalars, pure
-//! s2e_core::triage scores them, and the ranked csv feeds valid-plumes.txt
-//! curation. the optional --lines geojson (osm roads/boundaries/waterways)
-//! enables the collinearity check against each record's probability asset.
+//! deterministic triage over the published plume detections (UK_REVIEW.md's
+//! review layer): duckdb flattens them to scalars, pure s2e_core::triage scores
+//! them, and the ranked csv feeds valid-plumes.txt curation. the optional
+//! --lines geojson (osm roads/boundaries/waterways) enables the collinearity
+//! check against each record's probability asset.
 
 use crate::{read, view};
 use s2e_core::review::{dist_m, triage, PlumeCandidate};
 
 const LINE_BUFFER_M: f64 = 15.0; // ~1 px at 10 m
-const SWATH_MIN_KM: f64 = 90.0; // a full granule is ~110 km
 
 pub fn run(root: &str, lines: Option<&str>, out: Option<&str>) -> Result<(), String> {
     let base = root.trim_end_matches('/');
     let tmp = view::tmp("review.csv");
     let tmp_s = tmp.to_string_lossy();
-    // one flat row per detected feature; envelope corners + scene footprint size
-    // are extracted in sql so the csv stays quote-free.
+    // one flat row per plume; the mask envelope corners are extracted in sql so
+    // the csv stays quote-free. the observations join is where the facility
+    // position and the scene's clear fraction live now — the detection row
+    // carries the plume, the observation row carries the look that found it.
     view::duckdb(&format!(
-        "{p}COPY (SELECT target_id, date, id, scene, lon, lat, target_lon, target_lat, \
-           wind[1] AS wu, wind[2] AS wv, sun_elevation, clear_percent, flux_rate_kg_h, \
-           max_probability, \
-           json_extract(geometry,'$.coordinates[0][0][0]')::DOUBLE AS gw, \
-           json_extract(geometry,'$.coordinates[0][0][1]')::DOUBLE AS gs, \
-           json_extract(geometry,'$.coordinates[0][2][0]')::DOUBLE AS ge, \
-           json_extract(geometry,'$.coordinates[0][2][1]')::DOUBLE AS gn, \
-           scene_w_deg, scene_h_deg, probability_asset, background_scene \
-         FROM read_parquet('{base}/data-desk/retrievals/*.parquet') \
-         WHERE detected AND status='ok') TO '{tmp_s}' (FORMAT CSV, HEADER)",
+        "{p}COPY (SELECT d.site_id, d.date, str_split(d.id,':')[-1] AS plume_id, d.scene, \
+           d.lon, d.lat, o.lon AS target_lon, o.lat AS target_lat, \
+           d.wind[1] AS wu, d.wind[2] AS wv, d.sun_elevation, \
+           (1 - o.cloud) * 100 AS clear_percent, d.rate_kg_h, d.max_probability, \
+           json_extract(d.geometry,'$.coordinates[0][0][0]')::DOUBLE AS gw, \
+           json_extract(d.geometry,'$.coordinates[0][0][1]')::DOUBLE AS gs, \
+           json_extract(d.geometry,'$.coordinates[0][2][0]')::DOUBLE AS ge, \
+           json_extract(d.geometry,'$.coordinates[0][2][1]')::DOUBLE AS gn, \
+           d.probability_asset, d.background_scene \
+         FROM read_parquet('{base}/data-desk/detections/**/data.parquet') d \
+         LEFT JOIN read_parquet('{base}/data-desk/observations/**/data.parquet') o \
+           ON o.provider=d.provider AND o.kind=d.kind AND o.site_id=d.site_id AND o.date=d.date \
+         WHERE d.kind='plume' AND d.provider='data-desk' AND d.status='ok') \
+         TO '{tmp_s}' (FORMAT CSV, HEADER)",
         p = view::s3_prelude()
     ))?;
     let text = std::fs::read_to_string(&tmp).map_err(|e| format!("read rows: {e}"))?;
@@ -35,23 +40,26 @@ pub fn run(root: &str, lines: Option<&str>, out: Option<&str>) -> Result<(), Str
     let segments = lines.map(line_segments).transpose()?;
     let mut cands = Vec::new();
     let mut orbits = Vec::new();
-    for line in text.lines().skip(1) {
+    let mut rows = text.lines();
+    let cols = view::columns(rows.next().unwrap_or_default());
+    for line in rows.filter(|l| !l.is_empty()) {
         let v: Vec<&str> = line.split(',').collect();
-        if v.len() < 21 {
-            continue;
-        }
-        let num = |i: usize| v[i].parse::<f64>().ok();
-        let (Some(clon), Some(clat)) = (num(4), num(5)) else {
+        let s = |n: &str| cols.get(n).and_then(|&i| v.get(i)).copied().unwrap_or("");
+        let num = |n: &str| s(n).parse::<f64>().ok();
+        let (Some(clon), Some(clat)) = (num("lon"), num("lat")) else {
             continue;
         };
         let centre = [clon, clat];
-        let target = [num(6).unwrap_or(clon), num(7).unwrap_or(clat)];
+        let target = [
+            num("target_lon").unwrap_or(clon),
+            num("target_lat").unwrap_or(clat),
+        ];
         // mask envelope (ring corners 0 and 2), centre when geometry was null.
         let (gw, gs, ge, gn) = (
-            num(14).unwrap_or(clon),
-            num(15).unwrap_or(clat),
-            num(16).unwrap_or(clon),
-            num(17).unwrap_or(clat),
+            num("gw").unwrap_or(clon),
+            num("gs").unwrap_or(clat),
+            num("ge").unwrap_or(clon),
+            num("gn").unwrap_or(clat),
         );
         let env = [gw.min(ge), gs.min(gn), gw.max(ge), gs.max(gn)];
         // plume onset: the envelope point nearest the facility.
@@ -59,31 +67,33 @@ pub fn run(root: &str, lines: Option<&str>, out: Option<&str>) -> Result<(), Str
             target[0].clamp(env[0], env[2]),
             target[1].clamp(env[1], env[3]),
         ];
-        let (w_km, h_km) = (
-            num(18).unwrap_or(2.0) * 111.32 * clat.to_radians().cos(),
-            num(19).unwrap_or(2.0) * 110.54,
-        );
+        let asset = s("probability_asset");
         let collinearity = segments
             .as_deref()
-            .filter(|_| !v[20].is_empty())
-            .and_then(|s| collinearity(base, v[20], env, s));
-        orbits.push(orbit(v[3]));
+            .filter(|_| !asset.is_empty())
+            .and_then(|seg| collinearity(base, asset, env, seg));
+        orbits.push(orbit(s("scene")));
         cands.push(PlumeCandidate {
-            key: format!("{}:{}:{}", v[0], v[1], v[2]),
-            target: v[0].into(),
-            date: v[1].into(),
+            // the curation key valid-plumes.txt holds, unchanged by the reshape:
+            // the site is the target it always was, and the plume component is
+            // the last field of the detection id the table now builds.
+            key: format!("{}:{}:{}", s("site_id"), s("date"), s("plume_id")),
+            target: s("site_id").into(),
+            date: s("date").into(),
             centre,
             origin,
             anchor_m: dist_m(target, origin),
-            wind: [num(8).unwrap_or(0.0), num(9).unwrap_or(0.0)],
-            max_p: num(13).unwrap_or(0.0),
-            flux_kg_h: num(12).unwrap_or(0.0),
-            clear_percent: num(11).unwrap_or(100.0),
-            sun_elevation: num(10),
-            swath_edge: w_km.min(h_km) < SWATH_MIN_KM,
+            wind: [num("wu").unwrap_or(0.0), num("wv").unwrap_or(0.0)],
+            max_p: num("max_probability").unwrap_or(0.0),
+            flux_kg_h: num("rate_kg_h").unwrap_or(0.0),
+            clear_percent: num("clear_percent").unwrap_or(100.0),
+            // null on every plume row until the detections table carries the
+            // scene's sun elevation as a plume extension; the term is inert
+            // rather than wrong while it is.
+            sun_elevation: num("sun_elevation"),
             cross_orbit_bg: {
-                let (s, b) = (orbit(v[3]), orbit(v.get(21).copied().unwrap_or("")));
-                !s.is_empty() && !b.is_empty() && s != b
+                let (a, b) = (orbit(s("scene")), orbit(s("background_scene")));
+                !a.is_empty() && !b.is_empty() && a != b
             },
             collinearity,
         });
