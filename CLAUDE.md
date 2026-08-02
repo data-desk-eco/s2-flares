@@ -67,9 +67,10 @@ when computed together, so partial runs never mutate another detector's result.
 Retrying the same method replaces the same deterministic path; a method change
 creates a new record.
 
-GeoJSON records and assets are authoritative. `views` creates disposable Parquet
-indexes (`views/detections/`, `ops/clouds/`, `views/retrievals/`); `cluster` creates another derived
-view. They may always be deleted and rebuilt from `observations/`.
+GeoJSON records and assets are authoritative. The ETL job creates disposable
+Parquet indexes at `data-desk/detections/`, private `ops/data-desk/clouds/`, and
+`data-desk/retrievals/`; `cluster` creates `data-desk/clusters/`. They may be
+rebuilt from the private raw observations.
 
 ## Methodology invariants
 
@@ -119,7 +120,8 @@ collinearity against the probability assets) into a ranked candidate CSV for
 
 Fleets and schedules are somebody else's. `data-desk`'s `infra/fleet.sh` boots N
 CloudFerro boxes, pushes a binary and a payload, launches, follows and tears down,
-and knows nothing about this detector. The `etl` repo's `s2e/` owns which AOI runs
+and knows nothing about this detector. The ETL repository's
+`providers/data-desk/s2e/` owns which AOI runs
 over which window, and the cadence. A run pins a tagged release fetched from the
 archive, not a working tree.
 

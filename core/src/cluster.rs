@@ -85,7 +85,7 @@ fn quarter_start(date: &str) -> Option<String> {
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QuarterObs {
-    /// first day of the quarter, matching views/vnf/quarters.parquet's key.
+    /// First day of the quarter, matching data-desk/vnf/quarters.parquet.
     pub quarter: String,
     pub observations: u32,
 }

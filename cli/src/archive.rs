@@ -141,7 +141,7 @@ fn write_object(path: &str, body: &str) -> Result<(), String> {
     }
 }
 
-/// Merge the scanned AOI into `web/coverage.geojson` under ROOT — the web map's
+/// Merge the scanned AOI into `coverage.geojson` under ROOT — the web map's
 /// coverage overlay and the archive-vs-detect check. Keyed by feature id, so a
 /// re-scan replaces its own entry and a new AOI appends: coverage only grows.
 /// Each entry is the AOI geometry stamped with the window that scanned it.
@@ -152,7 +152,7 @@ pub fn coverage(
     end: &str,
     scanned: &str,
 ) -> Result<(usize, usize), String> {
-    let key = join(root, "web/coverage.geojson");
+    let key = join(root, "coverage.geojson");
     let published: serde_json::Value = read_object(&key)
         .and_then(|body| serde_json::from_str(&body).ok())
         .unwrap_or_else(|| serde_json::json!({"type": "FeatureCollection", "features": []}));
@@ -226,7 +226,7 @@ mod tests {
     }
 
     fn published(root: &str) -> Vec<serde_json::Value> {
-        let body = fs::read_to_string(join(root, "web/coverage.geojson")).unwrap();
+        let body = fs::read_to_string(join(root, "coverage.geojson")).unwrap();
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["features"]
             .as_array()
             .unwrap()

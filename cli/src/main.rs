@@ -110,13 +110,13 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         destination: Option<String>,
     },
-    /// Deterministic plume triage: score views/retrievals (wind consistency,
+    /// Deterministic plume triage: score data-desk/retrievals (wind consistency,
     /// fixed-offset recurrence, scene-day regimes, magnitude prior, scene
     /// hygiene, optional OSM collinearity) into a ranked candidate list for
     /// valid-plume curation (etl/s2e/sql/valid-plumes.txt). Never mutates canonical
     /// records; rebuild the views first so they carry target/sun/footprint.
     Review {
-        /// Store ROOT containing views/retrievals (local dir or s3:// prefix).
+        /// Store ROOT containing data-desk/retrievals (local dir or s3:// prefix).
         #[arg(long, value_name = "ROOT")]
         root: String,
         /// Linear features GeoJSON (OSM roads/boundaries/waterways/hedges) for
@@ -141,9 +141,9 @@ enum Cmd {
         #[arg(long, value_name = "I/N", value_parser = parse_shard)]
         shard: Option<(usize, usize)>,
     },
-    /// Merge a scanned AOI into the published web/coverage.geojson under ROOT.
+    /// Merge a scanned AOI into the published coverage.geojson under ROOT.
     Coverage {
-        /// Store ROOT holding web/ (local dir or s3:// prefix).
+        /// Store ROOT that receives coverage.geojson (local dir or s3:// prefix).
         #[arg(long, value_name = "ROOT")]
         root: String,
         /// The AOI that was scanned.

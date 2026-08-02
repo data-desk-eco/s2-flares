@@ -46,9 +46,9 @@ working materials:
 barrow passes every test: compact (458 px), origin on the pipeline, elongated
 downwind, non-repeating, plausible magnitude. the discriminators are real.
 
-## deterministic review layer (automated triage over views/retrievals)
+## Deterministic review layer
 
-a scored verdict pass over the disposable retrievals view — never mutating
+A scored verdict pass over `data-desk/retrievals` that never mutates
 canonical records; output is a ranked candidate list for `data/valid-plumes.txt`
 curation. checks, strongest first:
 

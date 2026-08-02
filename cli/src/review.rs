@@ -25,7 +25,7 @@ pub fn run(root: &str, lines: Option<&str>, out: Option<&str>) -> Result<(), Str
            json_extract(geometry,'$.coordinates[0][2][0]')::DOUBLE AS ge, \
            json_extract(geometry,'$.coordinates[0][2][1]')::DOUBLE AS gn, \
            scene_w_deg, scene_h_deg, probability_asset, background_scene \
-         FROM read_parquet('{base}/views/retrievals/*.parquet') \
+         FROM read_parquet('{base}/data-desk/retrievals/*.parquet') \
          WHERE detected AND status='ok') TO '{tmp_s}' (FORMAT CSV, HEADER)",
         p = view::s3_prelude()
     ))?;
