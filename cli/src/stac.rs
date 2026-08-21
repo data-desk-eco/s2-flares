@@ -74,6 +74,12 @@ fn href(it: &Value, key: &str) -> Option<String> {
     it["assets"][key]["href"].as_str().map(String::from)
 }
 
+/// The scene classification href under either L2A profile: cdse names it `SCL_20m`,
+/// aws names it `scl`. This is the only asset the twin search is for.
+fn scl_href(it: &Value) -> Option<String> {
+    href(it, "SCL_20m").or_else(|| href(it, "scl"))
+}
+
 fn aws_l1c_href(it: &Value, key: &str) -> Option<String> {
     href(it, key).map(|url| {
         url.strip_prefix("s3://sentinel-s2-l1c/")
@@ -544,15 +550,7 @@ pub fn discover(
         // cloud record indistinguishable from "we looked and nothing was clear".
         // a partial mask is the worst case of all: it undercounts n_clear_obs and
         // silently OVERSTATES persistence. fail the run instead.
-        let twins = discover(area, start, end, l2a_twin(source))?;
-        let scl: std::collections::HashMap<String, String> = twins
-            .into_iter()
-            .filter_map(|t| {
-                t.bands
-                    .scl
-                    .map(|href| (format!("{}_{}", t.mgrs, t.date), href))
-            })
-            .collect();
+        let scl = discover_scl(&q, start, end, l2a_twin(source))?;
         for it in out.iter_mut() {
             if it.bands.scl.is_none() {
                 it.bands.scl = scl.get(&format!("{}_{}", it.mgrs, it.date)).cloned();
@@ -570,6 +568,56 @@ pub fn discover(
         }
     }
     Ok(out)
+}
+
+/// The L2A cloud masks for a window, as tile+date -> SCL href.
+///
+/// This is the twin search, and it is the expensive half of discovery: L2A caps a page
+/// at 200 where L1C takes 1000, so it is five times the requests for the same span.
+/// All it contributes is one href per tile and date, so it folds straight into that —
+/// building a full `Item` per L2A scene, with the thirteen band hrefs nothing reads,
+/// was most of what made discovery's memory unaffordable on a shared box.
+fn discover_scl(
+    q: &[[f64; 4]],
+    start: &str,
+    end: &str,
+    source: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    // keep the clearest scene per tile and date, exactly as the L1C side does, so the
+    // mask that lands on a scene is the one its own dedup would have chosen.
+    let mut best: std::collections::HashMap<String, (String, f64)> =
+        std::collections::HashMap::new();
+    paginate(q, start, end, source, |features| {
+        for it in features.drain(..) {
+            let inside = it["bbox"].as_array().is_none_or(|b| {
+                let v: Vec<f64> = b.iter().filter_map(|x| x.as_f64()).collect();
+                v.len() != 4
+                    || (v[2] - v[0] < 5.0
+                        && q.iter()
+                            .any(|e| v[0] <= e[2] && v[2] >= e[0] && v[1] <= e[3] && v[3] >= e[1]))
+            });
+            if !inside {
+                continue;
+            }
+            let Some(href) = scl_href(&it) else { continue };
+            let p = &it["properties"];
+            let date = p["datetime"].as_str().unwrap_or("").get(..10).unwrap_or("");
+            let tile = p["grid:code"]
+                .as_str()
+                .or_else(|| p["s2:mgrs_tile"].as_str())
+                .unwrap_or("")
+                .replace("MGRS-", "");
+            let cloud = p["eo:cloud_cover"].as_f64().unwrap_or(100.0);
+            let key = format!("{tile}_{date}");
+            match best.get(&key) {
+                Some((_, c)) if *c <= cloud => {}
+                _ => {
+                    best.insert(key, (href, cloud));
+                }
+            }
+        }
+    })?;
+    Ok(best.into_iter().map(|(k, (h, _))| (k, h)).collect())
 }
 
 /// One feature's scenes straight from the catalogue: discovery over its envelope,

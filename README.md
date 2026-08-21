@@ -47,7 +47,7 @@ target/release/s2e detect --mode flares --region 51.4,25.8,51.7,26.1
 # then makes no catalogue requests at all, and a resume makes none either.
 target/release/s2e discover \
   --aoi aoi/uk-gas-import-terminals.geojson --source cdse-l1c \
-  --start 2026-01-01 --end 2026-07-17 --out scenes.ndjson.gz
+  --start 2026-01-01 --end 2026-07-17 --jobs 4 --out scenes.ndjson.gz
 target/release/s2e detect --aoi aoi/uk-gas-import-terminals.geojson \
   --scenes scenes.ndjson.gz --start 2026-01-01 --end 2026-07-17 --out out/uk
 
@@ -77,6 +77,12 @@ GEOS refuses to intersect against overlapping parts — and writes every scene i
 as a gzipped NDJSON manifest: a header line, then one scene per line. The cloud
 threshold is deliberately not applied, so one manifest serves any `--cloud`, every
 shard, and both detectors.
+
+A long campaign splits with `--jobs N`: the window becomes N sub-windows resolved at
+once. Requests share one process-wide pace, so this overlaps the waiting rather than
+asking faster, and the endpoint sees the same steady stream either way. Each job holds
+its own scene list, so raise it on a machine with the memory for it — a nine-year
+European campaign is a gigabyte or so per job — and not on a shared control plane.
 
 `detect --scenes` then selects each feature's scenes from that file using the same
 envelope test discovery used, so a manifest run and a per-feature search return the

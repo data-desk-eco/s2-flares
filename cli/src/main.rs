@@ -86,6 +86,12 @@ enum Cmd {
         /// selection reads from the manifest too rather than going to the network.
         #[arg(long, value_name = "DAYS", default_value_t = detect::PLUME_PAD_DAYS)]
         pad: i64,
+        /// Split the window into this many sub-windows and resolve them at once. The
+        /// requests still share one pace, so this overlaps the waiting rather than
+        /// asking faster. Each job holds its own scene list, so raise it on a machine
+        /// with the memory for it, not on the control plane.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        jobs: usize,
         #[command(flatten)]
         c: Common,
     },
@@ -529,7 +535,13 @@ fn main() {
                 die("methane plume detection requires an L1C --source");
             }
         }
-        Cmd::Discover { c, out, batch, pad } => discover::run(c, out, *batch, *pad),
+        Cmd::Discover {
+            c,
+            out,
+            batch,
+            pad,
+            jobs,
+        } => discover::run(c, out, *batch, *pad, *jobs),
         Cmd::Cluster {
             detections,
             clusters: out,
