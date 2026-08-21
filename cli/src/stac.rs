@@ -239,15 +239,29 @@ fn post_page(url: &str, body: &Value) -> Result<Value, String> {
             .set("Content-Type", "application/json")
             .send_json(body.clone());
         let (err, stated) = match result {
-            Ok(resp) => match resp.into_json() {
-                Ok(data) => return Ok(data),
-                Err(e) => {
-                    return Err(format!(
-                        "stac: response was not json ({e}) — the endpoint rejected the request \
-                         rather than answering it, so the query itself has to change"
-                    ))
+            Ok(resp) => {
+                // read the body before parsing it, so a connection reset partway
+                // through a large answer stays what it is — transport, and worth
+                // retrying — instead of being mistaken for the rejection page below.
+                let mut body = Vec::new();
+                match std::io::Read::read_to_end(&mut resp.into_reader(), &mut body) {
+                    Ok(_) => match serde_json::from_slice::<Value>(&body) {
+                        Ok(data) => return Ok(data),
+                        // a complete body that is not json is the edge's own rejection
+                        // page, which it serves with status 200. retrying it only
+                        // spends more of the budget that made it reject us.
+                        Err(e) => {
+                            return Err(format!(
+                                "stac: the endpoint returned {} bytes that are not json ({e}) — \
+                                 it rejected the request rather than answering it, so the query \
+                                 itself has to change",
+                                body.len()
+                            ))
+                        }
+                    },
+                    Err(e) => (format!("stac body: {e}"), None),
                 }
-            },
+            }
             Err(ureq::Error::Status(code, resp)) if retryable(code) => {
                 let wait = resp
                     .header("Retry-After")
@@ -357,15 +371,25 @@ fn payload(area: &[[f64; 4]], start: &str, end: &str, source: &str) -> Value {
     p
 }
 
-/// Page through one search and return the raw features.
-fn query(area: &[[f64; 4]], start: &str, end: &str, source: &str) -> Result<Vec<Value>, String> {
-    let mut features: Vec<Value> = Vec::new();
+/// Page through one search, handing each page to `fold` and dropping it.
+///
+/// The raw STAC answer is enormous next to what we keep — a page of 1000 items is
+/// tens of megabytes of asset objects and geometry, and a long window runs to
+/// hundreds of pages. Accumulating them all cost well over a gigabyte per search
+/// and had the kernel kill discovery on a shared box. Fold as they arrive.
+fn paginate(
+    area: &[[f64; 4]],
+    start: &str,
+    end: &str,
+    source: &str,
+    mut fold: impl FnMut(&mut Vec<Value>),
+) -> Result<(), String> {
     let mut url = format!("{}/search", api(source));
     let mut body = payload(area, start, end, source);
     loop {
-        let data = post_page(&url, &body)?;
-        if let Some(arr) = data["features"].as_array() {
-            features.extend(arr.iter().cloned());
+        let mut data = post_page(&url, &body)?;
+        if let Some(arr) = data["features"].as_array_mut() {
+            fold(arr);
         }
         // follow the rel:next link (post body) if present.
         let next = data["links"]
@@ -379,7 +403,7 @@ fn query(area: &[[f64; 4]], start: &str, end: &str, source: &str) -> Result<Vec<
             None => break,
         }
     }
-    Ok(features)
+    Ok(())
 }
 
 /// Does a scene envelope meet a query envelope? Discovery drops what fails this, and
@@ -416,99 +440,94 @@ pub fn discover(
         return Ok(Vec::new());
     }
     let q: Vec<[f64; 4]> = area.iter().map(|b| widen(*b)).collect();
-    let mut features = query(&q, start, end, source)?;
 
-    // cdse occasionally returns antimeridian tiles for queries anywhere on the
-    // globe (seen: pacific t01/t60 items for a uk point search, with degenerate
-    // [-179.57..180] bboxes that intersect everything). a stray scene computes a
-    // chip window half a world from its raster and ooms the box, so drop items
-    // whose bbox misses every query envelope or is wider than any real s2 tile.
-    features.retain(|it| {
-        it["bbox"].as_array().is_none_or(|b| {
-            let v: Vec<f64> = b.iter().filter_map(|x| x.as_f64()).collect();
-            v.len() != 4
-                || (v[2] - v[0] < 5.0
-                    && q.iter()
-                        .any(|e| v[0] <= e[2] && v[2] >= e[0] && v[1] <= e[3] && v[3] >= e[1]))
-        })
-    });
-
-    // dedup by tile+date, keep lowest cloud.
-    let mut best: std::collections::HashMap<String, (Value, f64)> =
+    // dedup by tile+date keeping lowest cloud, folded in a page at a time and kept as
+    // the Item we actually want rather than the whole STAC record.
+    let mut best: std::collections::HashMap<String, (Item, f64)> =
         std::collections::HashMap::new();
-    for it in features {
-        let p = &it["properties"];
-        let dt = p["datetime"]
-            .as_str()
-            .unwrap_or("")
-            .get(..10)
-            .unwrap_or("")
-            .to_string();
-        let cloud = p["eo:cloud_cover"].as_f64().unwrap_or(100.0);
-        let tile = p["grid:code"]
-            .as_str()
-            .or_else(|| p["s2:mgrs_tile"].as_str())
-            .or_else(|| it["id"].as_str())
-            .unwrap_or("")
-            .to_string();
-        // temporary experiment override: S2_KEEP_ORBITS=1 keys the dedup by
-        // orbit too, so same-day dual-look acquisitions both survive.
-        let orbit = if std::env::var("S2_KEEP_ORBITS").is_ok() {
-            it["id"]
-                .as_str()
-                .unwrap_or("")
-                .split('_')
-                .find(|t| t.len() == 4 && t.starts_with('R'))
-                .unwrap_or("")
-        } else {
-            ""
-        };
-        let key = format!("{tile}_{dt}_{orbit}");
-        match best.get(&key) {
-            Some((_, c)) if *c <= cloud => {}
-            _ => {
-                best.insert(key, (it, cloud));
+    let keep_orbits = std::env::var("S2_KEEP_ORBITS").is_ok();
+    paginate(&q, start, end, source, |features| {
+        for it in features.drain(..) {
+            // cdse occasionally returns antimeridian tiles for queries anywhere on the
+            // globe (seen: pacific t01/t60 items for a uk point search, with degenerate
+            // [-179.57..180] bboxes that intersect everything). a stray scene computes a
+            // chip window half a world from its raster and ooms the box, so drop items
+            // whose bbox misses every query envelope or is wider than any real s2 tile.
+            let inside = it["bbox"].as_array().is_none_or(|b| {
+                let v: Vec<f64> = b.iter().filter_map(|x| x.as_f64()).collect();
+                v.len() != 4
+                    || (v[2] - v[0] < 5.0
+                        && q.iter()
+                            .any(|e| v[0] <= e[2] && v[2] >= e[0] && v[1] <= e[3] && v[3] >= e[1]))
+            });
+            if !inside {
+                continue;
             }
-        }
-    }
-
-    let mut out = Vec::new();
-    for (it, _) in best.into_values() {
-        let p = &it["properties"];
-        out.push(Item {
-            id: it["id"].as_str().unwrap_or("").to_string(),
-            date: p["datetime"]
+            let p = &it["properties"];
+            let date = p["datetime"]
                 .as_str()
                 .unwrap_or("")
                 .get(..10)
                 .unwrap_or("")
-                .to_string(),
-            datetime: p["datetime"].as_str().unwrap_or("").to_string(),
-            cloud_cover: p["eo:cloud_cover"].as_f64(),
-            mgrs: p["grid:code"]
+                .to_string();
+            let cloud = p["eo:cloud_cover"].as_f64();
+            let tile = p["grid:code"]
                 .as_str()
                 .or_else(|| p["s2:mgrs_tile"].as_str())
+                .or_else(|| it["id"].as_str())
                 .unwrap_or("")
-                .replace("MGRS-", ""),
-            epsg: epsg_of(&it, source),
-            bbox: {
-                let b = it["bbox"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                [
-                    b.first().copied().unwrap_or(0.0),
-                    b.get(1).copied().unwrap_or(0.0),
-                    b.get(2).copied().unwrap_or(0.0),
-                    b.get(3).copied().unwrap_or(0.0),
-                ]
-            },
-            sun_elevation: p["view:sun_elevation"].as_f64(),
-            sun_azimuth: p["view:sun_azimuth"].as_f64(),
-            bands: bands_of(&it, source),
-            level: level(source).to_string(),
-        });
-    }
+                .to_string();
+            // temporary experiment override: S2_KEEP_ORBITS=1 keys the dedup by
+            // orbit too, so same-day dual-look acquisitions both survive.
+            let orbit = if keep_orbits {
+                it["id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .split('_')
+                    .find(|t| t.len() == 4 && t.starts_with('R'))
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let key = format!("{tile}_{date}_{orbit}");
+            if let Some((_, c)) = best.get(&key) {
+                if *c <= cloud.unwrap_or(100.0) {
+                    continue;
+                }
+            }
+            let item = Item {
+                id: it["id"].as_str().unwrap_or("").to_string(),
+                date,
+                datetime: p["datetime"].as_str().unwrap_or("").to_string(),
+                cloud_cover: cloud,
+                mgrs: p["grid:code"]
+                    .as_str()
+                    .or_else(|| p["s2:mgrs_tile"].as_str())
+                    .unwrap_or("")
+                    .replace("MGRS-", ""),
+                epsg: epsg_of(&it, source),
+                bbox: {
+                    let b = it["bbox"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    [
+                        b.first().copied().unwrap_or(0.0),
+                        b.get(1).copied().unwrap_or(0.0),
+                        b.get(2).copied().unwrap_or(0.0),
+                        b.get(3).copied().unwrap_or(0.0),
+                    ]
+                },
+                sun_elevation: p["view:sun_elevation"].as_f64(),
+                sun_azimuth: p["view:sun_azimuth"].as_f64(),
+                bands: bands_of(&it, source),
+                level: level(source).to_string(),
+            };
+            best.insert(key, (item, cloud.unwrap_or(100.0)));
+        }
+    })?;
+
+    let mut out: Vec<Item> = best.into_values().map(|(i, _)| i).collect();
 
     // cloud is cloud. the scene classification (SCL) ships only with L2A, so a
     // detector reading L1C radiometry had bands.scl = None and wrote an empty
@@ -516,8 +535,7 @@ pub fn discover(
     // from the flare method and 9,595 of 9,603 clusters have no clear-sky
     // denominator. the mask does not depend on the radiometry we detect in, so
     // resolve it from the L2A twin of the same acquisition (same tile, same day)
-    // whatever --source asks for. a failed twin search degrades to no mask rather
-    // than failing the run, and scenes with no L2A counterpart (some pre-2018)
+    // whatever --source asks for. scenes with no L2A counterpart (some pre-2018)
     // keep scl: None — unrated, which is honest, not counted as clear.
     if level(source) == "l1c" {
         // propagate, don't degrade. post_page already retries transient failures
