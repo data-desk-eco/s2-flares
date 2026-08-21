@@ -8,6 +8,38 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Plume background selection reaches this far either side of the requested window,
+/// so a search (or a manifest) has to cover it.
+pub const PLUME_PAD_DAYS: i64 = 120;
+
+/// One AOI feature's scenes: selected out of the campaign manifest when the run has
+/// one, else searched for as the loop reaches the feature.
+///
+/// Selecting applies the same envelope test discovery applied and the same cloud
+/// filter the search would have applied, so the two paths return the same scenes for
+/// the same feature. The date bound matters here in a way it does not for a search:
+/// the manifest deliberately covers a wider window than any one pass wants.
+fn scenes_for(
+    scenes: Option<&[stac::Item]>,
+    aoi: &Aoi,
+    start: &str,
+    end: &str,
+    cloud: f64,
+    source: &str,
+) -> Result<Vec<stac::Item>, String> {
+    match scenes {
+        Some(all) => Ok(stac::filter_cloud(
+            all.iter()
+                .filter(|i| stac::meets(i, aoi.bbox))
+                .filter(|i| i.date.as_str() >= start && i.date.as_str() <= end)
+                .cloned()
+                .collect(),
+            cloud,
+        )),
+        None => stac::search(aoi.bbox, start, end, cloud, source),
+    }
+}
+
 fn method(name: &str, parameters: Value) -> Value {
     let mut value = json!({
         "name": name,
@@ -239,6 +271,7 @@ fn relative_record_name(path: &Path) -> String {
 pub fn run_targeted(
     c: &Common,
     out: &str,
+    scenes: Option<&[stac::Item]>,
     mode: DetectorMode,
     model_dir: Option<&str>,
     fixed_wind: Option<[f32; 2]>,
@@ -269,8 +302,8 @@ pub fn run_targeted(
     );
     let aois = super::load_aois(c);
     let (start, end) = c.dates();
-    let search_start = super::shift_date(&start, -120);
-    let search_end = super::shift_date(&end, 120);
+    let search_start = super::shift_date(&start, -PLUME_PAD_DAYS);
+    let search_end = super::shift_date(&end, PLUME_PAD_DAYS);
     let thresholds = c.thresholds();
     let flare_reader = read::make_reader(false, false).unwrap_or_else(|e| super::die(&e));
     let mut counts = [0usize; 5]; // scenes, cached, flares, plumes, errors
@@ -282,7 +315,7 @@ pub fn run_targeted(
         let lon = (aoi.bbox[0] + aoi.bbox[2]) * 0.5;
         let lat = (aoi.bbox[1] + aoi.bbox[3]) * 0.5;
         let mut candidates =
-            match stac::search(aoi.bbox, &search_start, &search_end, 100.0, &c.source) {
+            match scenes_for(scenes, aoi, &search_start, &search_end, 100.0, &c.source) {
                 Ok(items) => items,
                 Err(e) => {
                     eprintln!("  {} search FAIL: {e}", aoi.id);
@@ -513,7 +546,12 @@ pub fn run_targeted(
     );
 }
 
-pub fn run_flares(c: &Common, out: &str, pool: &rayon::ThreadPool) {
+pub fn run_flares(
+    c: &Common,
+    out: &str,
+    scenes: Option<&[stac::Item]>,
+    pool: &rayon::ThreadPool,
+) {
     let root = Path::new(out);
     let thresholds = c.thresholds();
     let flare_method = flare_method(
@@ -534,7 +572,7 @@ pub fn run_flares(c: &Common, out: &str, pool: &rayon::ThreadPool) {
         aois.len()
     );
     for aoi in &aois {
-        let mut items = match stac::search(aoi.bbox, &start, &end, c.cloud, &c.source) {
+        let mut items = match scenes_for(scenes, aoi, &start, &end, c.cloud, &c.source) {
             Ok(items) => items,
             Err(e) => {
                 totals[3] += 1;

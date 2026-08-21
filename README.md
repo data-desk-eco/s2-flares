@@ -43,6 +43,14 @@ target/release/s2e detect \
 target/release/s2e detect --mode plumes --bbox 53.79,39.35,53.81,39.37
 target/release/s2e detect --mode flares --region 51.4,25.8,51.7,26.1
 
+# Resolve a campaign's scenes once, into a manifest the whole fleet reads. Detection
+# then makes no catalogue requests at all, and a resume makes none either.
+target/release/s2e discover \
+  --aoi aoi/uk-gas-import-terminals.geojson --source cdse-l1c \
+  --start 2026-01-01 --end 2026-07-17 --out scenes.ndjson.gz
+target/release/s2e detect --aoi aoi/uk-gas-import-terminals.geojson \
+  --scenes scenes.ndjson.gz --start 2026-01-01 --end 2026-07-17 --out out/uk
+
 # Publish the canonical records unchanged. Turning them into Parquet is etl's
 # job (`etl/providers/data-desk/s2e/views`), so there is no `views` subcommand here.
 target/release/s2e archive --input out/uk --destination s3://bucket
@@ -53,6 +61,27 @@ target/release/s2e cluster \
   --detections staging/flares.parquet --clouds staging/clouds.parquet \
   --clusters staging/clusters.parquet --members staging/members.parquet
 ```
+
+## Discovery
+
+`detect` searches the catalogue once per AOI feature as it reaches it. That is fine
+for a handful of sites and the wrong shape for a campaign: the searches are serial,
+they all happen before any reading, each L1C search triggers a second for the L2A twin
+that carries the cloud mask, every fleet member repeats the work for its own shard, and
+a resume repeats all of it again. A large AOI over the full archive reaches tens of
+thousands of requests, and the endpoint sheds bursts past about seven.
+
+`discover` does that work once. It batches the AOI into as few searches as the endpoint
+takes — the features go as one MultiPolygon, with overlapping envelopes merged because
+GEOS refuses to intersect against overlapping parts — and writes every scene it finds
+as a gzipped NDJSON manifest: a header line, then one scene per line. The cloud
+threshold is deliberately not applied, so one manifest serves any `--cloud`, every
+shard, and both detectors.
+
+`detect --scenes` then selects each feature's scenes from that file using the same
+envelope test discovery used, so a manifest run and a per-feature search return the
+same scenes. The manifest is checked rather than trusted: a run whose source, AOI or
+window it does not cover is refused, and the message says which.
 
 Sources are `aws-l1c` (default), `cdse-l1c`, `aws` and `cdse`. Fixed `--wind-u`
 and `--wind-v` values make plume runs offline and reproducible; otherwise the

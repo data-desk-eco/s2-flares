@@ -6,8 +6,10 @@
 
 mod archive;
 mod detect;
+mod discover;
 #[cfg(feature = "gpu")]
 mod gpu;
+mod manifest;
 mod models;
 mod plume;
 mod read;
@@ -41,6 +43,12 @@ enum Cmd {
         /// Output directory for canonical observations/ and optional assets/.
         #[arg(long, value_name = "DIR", default_value = "out")]
         out: String,
+        /// Scene manifest from `s2e discover`, read instead of searching the
+        /// catalogue. A fleet member is given one so it never searches: discovery
+        /// happens once for the whole campaign and every member works the identical
+        /// scene list. Without it, each feature is searched as it comes.
+        #[arg(long, value_name = "FILE")]
+        scenes: Option<String>,
         /// Detector mode. AOI runs default to both related S2 signals; whole-tile
         /// region scans currently support the flare mode only.
         #[arg(long, value_enum, default_value_t = DetectorMode::Both)]
@@ -55,6 +63,29 @@ enum Cmd {
         #[arg(long, requires = "wind_u", allow_hyphen_values = true)]
         wind_v: Option<f32>,
         // Common (with its knobs help-heading) goes last so the heading doesn't leak.
+        #[command(flatten)]
+        c: Common,
+    },
+    /// Resolve the whole AOI's scene list once, into a manifest a fleet shares.
+    ///
+    /// Discovery is the fragile half of a bulk run: one catalogue search per feature,
+    /// all of it before any reading, against an endpoint that sheds bursts. This
+    /// batches the AOI into as few searches as the endpoint will take and writes what
+    /// they return, so a member never searches, a resume costs nothing, and every
+    /// member works from the same scenes.
+    Discover {
+        /// Manifest to write (gzipped NDJSON: a header line, then a scene per line).
+        #[arg(long, value_name = "FILE", default_value = "scenes.ndjson.gz")]
+        out: String,
+        /// AOI features per catalogue request. They are sent as one MultiPolygon, so
+        /// this is the batching factor; the endpoint rejects a request carrying the
+        /// whole of a large AOI, and a hundred is comfortably inside that.
+        #[arg(long, value_name = "N", default_value_t = 100)]
+        batch: usize,
+        /// Days either side of the window to cover, so a plume run's background
+        /// selection reads from the manifest too rather than going to the network.
+        #[arg(long, value_name = "DAYS", default_value_t = detect::PLUME_PAD_DAYS)]
+        pad: i64,
         #[command(flatten)]
         c: Common,
     },
@@ -410,6 +441,39 @@ fn load_aois(c: &Common) -> Vec<Aoi> {
         .collect()
 }
 
+/// Read the manifest a run was given and prove it fits: same catalogue, same AOI, and
+/// a window covering what this mode needs — plume selection reaches `PLUME_PAD_DAYS`
+/// either side of the requested dates. A manifest that does not fit stops the run
+/// rather than being ignored, because ignoring it would quietly search the network for
+/// thousands of features and look like nothing was wrong.
+fn load_manifest(c: &Common, path: &str, mode: DetectorMode) -> Vec<stac::Item> {
+    let Some(aoi) = c.aoi.as_deref() else {
+        die("detect --scenes: a manifest is built for an --aoi, so the run needs the same one");
+    };
+    let (start, end) = c.dates();
+    let (need_start, need_end) = match mode {
+        DetectorMode::Flares => (start, end),
+        _ => (
+            shift_date(&start, -detect::PLUME_PAD_DAYS),
+            shift_date(&end, detect::PLUME_PAD_DAYS),
+        ),
+    };
+    let sha = manifest::aoi_sha256(aoi).unwrap_or_else(|e| die(&e));
+    let (header, items) =
+        manifest::read(Path::new(path)).unwrap_or_else(|e| die(&format!("detect --scenes: {e}")));
+    manifest::check(&header, &c.source, &need_start, &need_end, &sha)
+        .unwrap_or_else(|e| die(&format!("detect --scenes: {e}")));
+    eprintln!(
+        "scenes: {} from {path} · {} -> {} · built {} in {} requests",
+        items.len(),
+        header.start,
+        header.end,
+        header.created,
+        header.requests
+    );
+    items
+}
+
 // the per-scene detection region: a whole tile (full_tile/--region wide-area) or the
 // query window. orthogonal to reader choice — the driver just passes this as `region`.
 fn det_bbox(aoi: &Aoi, item: &stac::Item) -> [f64; 4] {
@@ -440,6 +504,7 @@ fn main() {
         Cmd::Detect {
             c,
             out,
+            scenes,
             mode,
             models,
             wind_u,
@@ -448,20 +513,23 @@ fn main() {
             if c.bbox.is_none() && c.aoi.is_none() && c.region.is_none() {
                 die("detect: provide --bbox, --aoi, or --region");
             }
+            let manifest = scenes.as_deref().map(|path| load_manifest(c, path, *mode));
+            let scenes = manifest.as_deref();
             if c.region.is_some() {
                 if *mode != DetectorMode::Flares {
                     die("detect --mode both/plumes needs point or AOI targets; use --mode flares for a whole-tile --region scan");
                 }
-                detect::run_flares(c, out, &pool(c.concurrency));
+                detect::run_flares(c, out, scenes, &pool(c.concurrency));
             } else if c.source.ends_with("l1c") {
                 let fixed = wind_u.zip(*wind_v).map(|(u, v)| [u, v]);
-                detect::run_targeted(c, out, *mode, models.as_deref(), fixed);
+                detect::run_targeted(c, out, scenes, *mode, models.as_deref(), fixed);
             } else if *mode == DetectorMode::Flares {
-                detect::run_flares(c, out, &pool(c.concurrency));
+                detect::run_flares(c, out, scenes, &pool(c.concurrency));
             } else {
                 die("methane plume detection requires an L1C --source");
             }
         }
+        Cmd::Discover { c, out, batch, pad } => discover::run(c, out, *batch, *pad),
         Cmd::Cluster {
             detections,
             clusters: out,

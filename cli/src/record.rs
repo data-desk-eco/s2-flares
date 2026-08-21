@@ -100,7 +100,7 @@ pub fn scene(item: &crate::stac::Item, source: &str) -> Value {
         "datetime": item.datetime,
         "mgrs": item.mgrs,
         "satellite": item.id.get(..3).unwrap_or(""),
-        "level": item.level,
+        "level": item.level.clone(),
         "source": source,
         "sun_elevation": item.sun_elevation,
         "sun_azimuth": item.sun_azimuth,

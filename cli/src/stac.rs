@@ -5,9 +5,10 @@
 use std::time::Duration;
 
 use s2e_core::epsg_from_mgrs;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Bands {
     pub b01: Option<String>,
     pub b02: Option<String>,
@@ -27,7 +28,7 @@ pub struct Bands {
     pub granule_metadata: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)] // cloud_cover/bbox carried for parity; the whole-tile bbox feeds the scene-store cache
 pub struct Item {
     pub id: String,
@@ -41,7 +42,7 @@ pub struct Item {
     pub sun_azimuth: Option<f64>,
     pub bands: Bands,
     /// Sentinel product radiometry: "l1c" (TOA) or "l2a" (surface reflectance).
-    pub level: &'static str,
+    pub level: String,
 }
 
 fn api(source: &str) -> &'static str {
@@ -181,34 +182,85 @@ fn epsg_of(it: &Value, source: &str) -> i32 {
 
 const STAC_ATTEMPTS: usize = 7;
 
-fn retryable(e: &ureq::Error) -> bool {
-    match e {
-        ureq::Error::Transport(_) => true,
-        ureq::Error::Status(code, _) => *code == 408 || *code == 429 || *code >= 500,
+/// The catalogue caps a page per collection: L1C serves 1000, and L2A refuses more
+/// than 200 because its items are much larger. A bigger page is a shorter burst,
+/// and the burst is what the edge sheds.
+fn page_limit(source: &str) -> usize {
+    if level(source) == "l1c" {
+        1000
+    } else {
+        200
     }
 }
 
-/// POST one STAC page, retrying transient transport/HTTP failures and malformed
-/// responses. CDSE intermittently returns 500/504 under bulk load; failing an AOI
-/// search silently omits that site, so retry each pagination request in place rather
-/// than forcing a costly second run over the entire AOI catalogue.
+/// A WAF sits in front of the catalogue and sheds a burst past about seven requests,
+/// answering 429 with `Retry-After: 2`. Pagination sends its pages back to back, so
+/// without a floor between requests a single deep search becomes that burst. This is
+/// the whole reason bulk discovery used to stall.
+const PACE: Duration = Duration::from_millis(250);
+static LAST_REQUEST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many catalogue requests this process has made, for the manifest header.
+pub fn requests() -> usize {
+    REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn pace() {
+    let mut last = LAST_REQUEST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = *last {
+        let since = t.elapsed();
+        if since < PACE {
+            std::thread::sleep(PACE - since);
+        }
+    }
+    *last = Some(std::time::Instant::now());
+    REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn retryable(code: u16) -> bool {
+    code == 408 || code == 429 || code >= 500
+}
+
+/// POST one STAC page, retrying transient transport/HTTP failures. CDSE sheds load
+/// with 429/500/504; failing an AOI search silently omits that site, so retry each
+/// pagination request in place rather than forcing a costly second run over the
+/// entire AOI catalogue.
+///
+/// Two responses are not transient and must not be retried. A body that is not JSON
+/// is the WAF's own rejection page, which it serves with status 200 — retrying it
+/// seven times just spends the budget that made it reject us. And when the endpoint
+/// states a `Retry-After`, that is the wait to honour; the local backoff is only a
+/// guess at the same number.
 fn post_page(url: &str, body: &Value) -> Result<Value, String> {
     for attempt in 1..=STAC_ATTEMPTS {
+        pace();
         let result = ureq::post(url)
             .set("Content-Type", "application/json")
             .send_json(body.clone());
-        let err = match result {
+        let (err, stated) = match result {
             Ok(resp) => match resp.into_json() {
                 Ok(data) => return Ok(data),
-                Err(e) => format!("stac json: {e}"),
+                Err(e) => {
+                    return Err(format!(
+                        "stac: response was not json ({e}) — the endpoint rejected the request \
+                         rather than answering it, so the query itself has to change"
+                    ))
+                }
             },
-            Err(e) if retryable(&e) => format!("stac http: {e}"),
-            Err(e) => return Err(format!("stac http: {e}")),
+            Err(ureq::Error::Status(code, resp)) if retryable(code) => {
+                let wait = resp
+                    .header("Retry-After")
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                (format!("stac http: status {code}"), wait)
+            }
+            Err(e @ ureq::Error::Status(..)) => return Err(format!("stac http: {e}")),
+            Err(e) => (format!("stac http: {e}"), None),
         };
         if attempt == STAC_ATTEMPTS {
             return Err(format!("{err} after {STAC_ATTEMPTS} attempts"));
         }
-        let delay = 1u64 << (attempt - 1).min(4); // 1, 2, 4, 8, then 16 s
+        let delay = stated.unwrap_or(1u64 << (attempt - 1).min(4)); // 1, 2, 4, 8, then 16 s
         eprintln!(
             "  stac transient failure; retry {}/{} in {delay}s: {err}",
             attempt + 1,
@@ -219,38 +271,97 @@ fn post_page(url: &str, body: &Value) -> Result<Value, String> {
     unreachable!()
 }
 
-/// search a date window over a bbox, dedup by mgrs tile + date keeping lowest
-/// cloud cover, return normalised items (cloud cover ≤ max_cloud_cover).
-pub fn search(
-    bbox: [f64; 4],
-    start: &str,
-    end: &str,
-    max_cloud_cover: f64,
-    source: &str,
-) -> Result<Vec<Item>, String> {
-    let base = api(source);
-    // A GeoJSON Point has a zero-area envelope, which STAC APIs reject.  The
-    // plume reader still uses its fixed 2 km chip; this epsilon only makes the
-    // catalogue intersection well-defined.
-    let mut query_bbox = bbox;
-    if query_bbox[0] >= query_bbox[2] {
-        query_bbox[0] -= 1e-6;
-        query_bbox[2] += 1e-6;
+/// A GeoJSON Point has a zero-area envelope, which STAC APIs reject. The plume
+/// reader still uses its fixed 2 km chip; this epsilon only makes the catalogue
+/// intersection well-defined.
+fn widen(b: [f64; 4]) -> [f64; 4] {
+    let mut q = b;
+    if q[0] >= q[2] {
+        q[0] -= 1e-6;
+        q[2] += 1e-6;
     }
-    if query_bbox[1] >= query_bbox[3] {
-        query_bbox[1] -= 1e-6;
-        query_bbox[3] += 1e-6;
+    if q[1] >= q[3] {
+        q[1] -= 1e-6;
+        q[3] += 1e-6;
     }
-    let payload = serde_json::json!({
-        "collections": [format!("sentinel-2-{}", level(source))],
-        "bbox": query_bbox,
-        "datetime": format!("{start}T00:00:00Z/{end}T23:59:59Z"),
-        "limit": 100,
-    });
+    q
+}
 
+/// A MultiPolygon's parts may not overlap. GEOS answers an intersects against
+/// overlapping parts with a topology exception, which the endpoint returns as a 500 —
+/// and neighbouring AOI features overlap all the time, so a batch that merged nothing
+/// would fail on any pair of sites within a couple of kilometres of each other.
+///
+/// Merge every envelope that meets another into the box covering both, transitively.
+/// The query then asks for a superset of what the batch wanted, which costs a few
+/// extra scenes in the manifest and nothing in correctness: each feature still selects
+/// only the scenes its own envelope meets.
+fn disjoint(area: &[[f64; 4]]) -> Vec<[f64; 4]> {
+    let mut out: Vec<[f64; 4]> = Vec::new();
+    for &b in area {
+        let mut cur = b;
+        loop {
+            let mut merged = false;
+            let mut keep: Vec<[f64; 4]> = Vec::with_capacity(out.len());
+            for &o in &out {
+                if cur[0] <= o[2] && cur[2] >= o[0] && cur[1] <= o[3] && cur[3] >= o[1] {
+                    cur = [
+                        cur[0].min(o[0]),
+                        cur[1].min(o[1]),
+                        cur[2].max(o[2]),
+                        cur[3].max(o[3]),
+                    ];
+                    merged = true;
+                } else {
+                    keep.push(o);
+                }
+            }
+            out = keep;
+            if !merged {
+                break;
+            }
+        }
+        out.push(cur);
+    }
+    out
+}
+
+/// One envelope is a `bbox` query. Several become a MultiPolygon `intersects`, which
+/// the catalogue answers in a single request — so a batch of AOI features costs one
+/// round trip instead of one each, which is what takes a bulk run from tens of
+/// thousands of requests to a few hundred.
+fn payload(area: &[[f64; 4]], start: &str, end: &str, source: &str) -> Value {
+    let mut p = serde_json::json!({
+        "collections": [format!("sentinel-2-{}", level(source))],
+        "datetime": format!("{start}T00:00:00Z/{end}T23:59:59Z"),
+        "limit": page_limit(source),
+    });
+    match disjoint(area).as_slice() {
+        [one] => p["bbox"] = serde_json::json!(one),
+        many => {
+            let rings: Vec<_> = many
+                .iter()
+                .map(|b| {
+                    [[
+                        [b[0], b[1]],
+                        [b[2], b[1]],
+                        [b[2], b[3]],
+                        [b[0], b[3]],
+                        [b[0], b[1]],
+                    ]]
+                })
+                .collect();
+            p["intersects"] = serde_json::json!({"type": "MultiPolygon", "coordinates": rings});
+        }
+    }
+    p
+}
+
+/// Page through one search and return the raw features.
+fn query(area: &[[f64; 4]], start: &str, end: &str, source: &str) -> Result<Vec<Value>, String> {
     let mut features: Vec<Value> = Vec::new();
-    let mut url = format!("{base}/search");
-    let mut body = payload;
+    let mut url = format!("{}/search", api(source));
+    let mut body = payload(area, start, end, source);
     loop {
         let data = post_page(&url, &body)?;
         if let Some(arr) = data["features"].as_array() {
@@ -268,21 +379,57 @@ pub fn search(
             None => break,
         }
     }
+    Ok(features)
+}
+
+/// Does a scene envelope meet a query envelope? Discovery drops what fails this, and
+/// selecting one feature's scenes out of a manifest applies the identical test, which
+/// is why a manifest run and a per-feature search agree.
+pub fn meets(item: &Item, env: [f64; 4]) -> bool {
+    let q = widen(env);
+    let b = item.bbox;
+    b[2] - b[0] < 5.0 && b[0] <= q[2] && b[2] >= q[0] && b[1] <= q[3] && b[3] >= q[1]
+}
+
+/// Drop the scenes a run's cloud threshold excludes. This is a pure function of what
+/// `discover` returns, and the tile/date dedup ahead of it keeps the clearest scene
+/// regardless of the threshold — so one discovery serves any `--cloud`.
+pub fn filter_cloud(items: Vec<Item>, max_cloud_cover: f64) -> Vec<Item> {
+    items
+        .into_iter()
+        .filter(|it| it.cloud_cover.unwrap_or(100.0) <= max_cloud_cover)
+        .collect()
+}
+
+/// Every scene the catalogue holds for these envelopes over this window, deduplicated
+/// by tile and date keeping the clearest, with the L2A cloud mask resolved — and
+/// deliberately NOT filtered by cloud. The threshold is applied by `filter_cloud`
+/// afterwards, so one discovery serves any `--cloud` and a manifest need not be
+/// rebuilt to change it.
+pub fn discover(
+    area: &[[f64; 4]],
+    start: &str,
+    end: &str,
+    source: &str,
+) -> Result<Vec<Item>, String> {
+    if area.is_empty() {
+        return Ok(Vec::new());
+    }
+    let q: Vec<[f64; 4]> = area.iter().map(|b| widen(*b)).collect();
+    let mut features = query(&q, start, end, source)?;
 
     // cdse occasionally returns antimeridian tiles for queries anywhere on the
     // globe (seen: pacific t01/t60 items for a uk point search, with degenerate
     // [-179.57..180] bboxes that intersect everything). a stray scene computes a
     // chip window half a world from its raster and ooms the box, so drop items
-    // whose bbox misses the query envelope or is wider than any real s2 tile.
+    // whose bbox misses every query envelope or is wider than any real s2 tile.
     features.retain(|it| {
         it["bbox"].as_array().is_none_or(|b| {
             let v: Vec<f64> = b.iter().filter_map(|x| x.as_f64()).collect();
             v.len() != 4
                 || (v[2] - v[0] < 5.0
-                    && v[0] <= query_bbox[2]
-                    && v[2] >= query_bbox[0]
-                    && v[1] <= query_bbox[3]
-                    && v[3] >= query_bbox[1])
+                    && q.iter()
+                        .any(|e| v[0] <= e[2] && v[2] >= e[0] && v[1] <= e[3] && v[3] >= e[1]))
         })
     });
 
@@ -328,10 +475,6 @@ pub fn search(
     let mut out = Vec::new();
     for (it, _) in best.into_values() {
         let p = &it["properties"];
-        let cloud = p["eo:cloud_cover"].as_f64();
-        if cloud.unwrap_or(100.0) > max_cloud_cover {
-            continue;
-        }
         out.push(Item {
             id: it["id"].as_str().unwrap_or("").to_string(),
             date: p["datetime"]
@@ -341,7 +484,7 @@ pub fn search(
                 .unwrap_or("")
                 .to_string(),
             datetime: p["datetime"].as_str().unwrap_or("").to_string(),
-            cloud_cover: cloud,
+            cloud_cover: p["eo:cloud_cover"].as_f64(),
             mgrs: p["grid:code"]
                 .as_str()
                 .or_else(|| p["s2:mgrs_tile"].as_str())
@@ -363,7 +506,7 @@ pub fn search(
             sun_elevation: p["view:sun_elevation"].as_f64(),
             sun_azimuth: p["view:sun_azimuth"].as_f64(),
             bands: bands_of(&it, source),
-            level: level(source),
+            level: level(source).to_string(),
         });
     }
 
@@ -383,7 +526,7 @@ pub fn search(
         // cloud record indistinguishable from "we looked and nothing was clear".
         // a partial mask is the worst case of all: it undercounts n_clear_obs and
         // silently OVERSTATES persistence. fail the run instead.
-        let twins = search(bbox, start, end, 100.0, l2a_twin(source))?;
+        let twins = discover(area, start, end, l2a_twin(source))?;
         let scl: std::collections::HashMap<String, String> = twins
             .into_iter()
             .filter_map(|t| {
@@ -409,4 +552,132 @@ pub fn search(
         }
     }
     Ok(out)
+}
+
+/// One feature's scenes straight from the catalogue: discovery over its envelope,
+/// then the run's cloud threshold. A run with a manifest never reaches this.
+pub fn search(
+    bbox: [f64; 4],
+    start: &str,
+    end: &str,
+    max_cloud_cover: f64,
+    source: &str,
+) -> Result<Vec<Item>, String> {
+    Ok(filter_cloud(
+        discover(&[bbox], start, end, source)?,
+        max_cloud_cover,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(bbox: [f64; 4], cloud: f64) -> Item {
+        Item {
+            id: "S2A_MSIL1C_x".into(),
+            date: "2026-06-01".into(),
+            datetime: "2026-06-01T10:00:00Z".into(),
+            cloud_cover: Some(cloud),
+            mgrs: "30UXB".into(),
+            epsg: 32630,
+            bbox,
+            sun_elevation: None,
+            sun_azimuth: None,
+            bands: Bands {
+                b01: None, b02: None, b03: None, b04: None, b05: None, b06: None,
+                b07: None, b08: None, b12: None, b11: None, b8a: None, b09: None,
+                b10: None, scl: None, product_metadata: None, granule_metadata: None,
+            },
+            level: "l1c".into(),
+        }
+    }
+
+    /// Selecting a feature's scenes out of a manifest has to answer what a search for
+    /// that feature alone would have: the same envelope test, including the guard that
+    /// drops a degenerate antimeridian tile which would otherwise intersect everything.
+    #[test]
+    fn selection_matches_what_discovery_keeps() {
+        let feature = [-1.0, 51.0, -0.9, 51.1];
+        assert!(meets(&at([-1.5, 50.5, -0.5, 51.5], 0.0), feature)); // covers it
+        assert!(meets(&at([-1.0, 51.0, -0.9, 51.1], 0.0), feature)); // exactly it
+        assert!(!meets(&at([2.0, 51.0, 3.0, 51.5], 0.0), feature)); // elsewhere
+        assert!(!meets(&at([-179.6, 50.0, 180.0, 52.0], 0.0), feature)); // world-wide junk
+    }
+
+    /// A point AOI has a zero-area envelope, which the catalogue rejects and which a
+    /// naive intersection test would also fail.
+    #[test]
+    fn a_point_feature_still_meets_its_scene() {
+        let point = [-1.0, 51.0, -1.0, 51.0];
+        assert!(meets(&at([-1.5, 50.5, -0.5, 51.5], 0.0), point));
+    }
+
+    /// The threshold is applied after discovery, never during it, so one manifest
+    /// serves any --cloud.
+    #[test]
+    fn cloud_filter_is_a_pure_function_of_the_scene_list() {
+        let scenes = vec![at([-1.0, 51.0, -0.9, 51.1], 10.0), at([-1.0, 51.0, -0.9, 51.1], 80.0)];
+        assert_eq!(filter_cloud(scenes.clone(), 100.0).len(), 2);
+        assert_eq!(filter_cloud(scenes.clone(), 50.0).len(), 1);
+        assert_eq!(filter_cloud(scenes, 5.0).len(), 0);
+    }
+
+    /// Overlapping parts of a MultiPolygon make GEOS throw, and the endpoint turns that
+    /// into a 500 that no amount of retrying fixes — this is what made a batch of
+    /// neighbouring sites fail outright.
+    #[test]
+    fn overlapping_envelopes_are_merged_before_they_are_queried() {
+        // two sites a few km apart, envelopes overlapping
+        let merged = disjoint(&[[51.5, 25.8, 51.6, 25.9], [51.55, 25.85, 51.65, 25.95]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0], [51.5, 25.8, 51.65, 25.95]);
+        // a chain merges transitively, however the pairs are ordered
+        let chain = disjoint(&[
+            [0.0, 0.0, 1.0, 1.0],
+            [4.0, 4.0, 5.0, 5.0],
+            [0.5, 0.5, 4.5, 4.5],
+        ]);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0], [0.0, 0.0, 5.0, 5.0]);
+        // genuinely separate sites stay separate, so the batch keeps its precision
+        let apart = disjoint(&[[0.0, 0.0, 1.0, 1.0], [10.0, 10.0, 11.0, 11.0]]);
+        assert_eq!(apart.len(), 2);
+        // and a merged batch that collapses to one envelope goes back to a bbox query
+        let one = payload(
+            &[[51.5, 25.8, 51.6, 25.9], [51.55, 25.85, 51.65, 25.95]],
+            "2026-01-01", "2026-01-31", "cdse-l1c",
+        );
+        assert!(one["bbox"].is_array());
+        assert!(one["intersects"].is_null());
+    }
+
+    /// L2A items are much larger and the catalogue refuses a page over 200; asking for
+    /// 1000 there fails the whole search.
+    #[test]
+    fn page_size_respects_each_collection() {
+        assert_eq!(page_limit("cdse-l1c"), 1000);
+        assert_eq!(page_limit("aws-l1c"), 1000);
+        assert_eq!(page_limit("cdse"), 200);
+    }
+
+    /// Many envelopes go as one MultiPolygon, which is the batching the whole manifest
+    /// exists to make possible; one stays a plain bbox query.
+    #[test]
+    fn one_envelope_is_a_bbox_and_many_are_a_multipolygon() {
+        let one = payload(&[[-1.0, 51.0, -0.9, 51.1]], "2026-01-01", "2026-01-31", "cdse-l1c");
+        assert!(one["bbox"].is_array());
+        assert!(one["intersects"].is_null());
+        assert_eq!(one["limit"], 1000);
+
+        let many = payload(
+            &[[-1.0, 51.0, -0.9, 51.1], [2.0, 48.0, 2.1, 48.1]],
+            "2026-01-01", "2026-01-31", "cdse-l1c",
+        );
+        assert!(many["bbox"].is_null());
+        assert_eq!(many["intersects"]["type"], "MultiPolygon");
+        assert_eq!(many["intersects"]["coordinates"].as_array().unwrap().len(), 2);
+        // a closed ring per envelope
+        assert_eq!(many["intersects"]["coordinates"][0][0].as_array().unwrap().len(), 5);
+    }
 }
