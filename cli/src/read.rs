@@ -189,7 +189,16 @@ pub fn configure() {
 // s3://… → /vsis3/… ; http(s):// → /vsicurl/… ; /vsi* and local paths pass through.
 // (the /eodata s3fs mount was tried and is unreliable for this many-open access pattern
 // — 0/12 vs /vsis3's 12/12 sequentially — so eodata stays on /vsis3, hardened by the
-// GDAL HTTP retries above + the open() retry below.)
+// GDAL HTTP retries above + the open() retry below.
+//
+// it is not a speed choice, and it is worth not re-litigating: measured on a fleet
+// member, the two are the same. a 4 MB read at a 20 MB offset is 86-237 ms by signed
+// range request and 85-180 ms through the mount, and twelve 64 KB headers from twelve
+// files are 2.47 s against 2.27 s. same bytes, same endpoint, same network. what the
+// mount adds is a shared FUSE process every thread on the box goes through, and
+// metadata operations that S3 answers with LIST — a day directory of ~30,000 SAFEs
+// fails outright with EIO. /vsis3 also keeps GDAL's own retry and cache knobs, set
+// above, which the mount puts out of reach.)
 pub(crate) fn to_vsi(href: &str) -> String {
     if let Some(r) = href.strip_prefix("s3://") {
         format!("/vsis3/{r}")
